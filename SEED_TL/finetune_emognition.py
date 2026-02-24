@@ -307,7 +307,7 @@ def _finetune_one_split(args, device, features, labels, train_idx, val_idx, test
     # Load pretrained model
     channels = 4
     feature_dim = features.shape[-1]  # Should be 5 (DE bands)
-    model = DGCNN(channels, feature_dim, num_classes)
+    model = DGCNN(channels, feature_dim, num_classes, k=2, relu_is=1, layers=[64], dropout_rate=0.5)
 
     checkpoint_path = os.path.join(args.checkpoint, f'checkpoint-best{args.metric_choose}')
     if os.path.exists(checkpoint_path):

@@ -210,8 +210,9 @@ def main(args):
             print(f"  Train: {train_data.shape}, Val: {val_data.shape}, Test: {test_data.shape}")
 
             # Create DGCNN model for 4 channels
-            model = DGCNN(channels, feature_dim, num_classes)
-            print(f"  Model: DGCNN(electrodes={channels}, features={feature_dim}, classes={num_classes})")
+            # Pass layers explicitly (DGCNN only has defaults for 62/32 electrodes)
+            model = DGCNN(channels, feature_dim, num_classes, k=2, relu_is=1, layers=[64], dropout_rate=0.5)
+            print(f"  Model: DGCNN(electrodes={channels}, features={feature_dim}, classes={num_classes}, layers=[64])")
 
             # Create datasets
             dataset_train = torch.utils.data.TensorDataset(
@@ -245,8 +246,7 @@ def main(args):
                 optimizer=optimizer,
                 batch_size=args.batch_size,
                 epochs=args.epochs,
-                criterion=criterion,
-                test_sub_label=test_sub_label
+                criterion=criterion
             )
 
             best_metrics.append(round_metric)
