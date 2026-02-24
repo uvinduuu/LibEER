@@ -89,16 +89,21 @@ class SeedIVSetting:
 
         # Experiment mode
         if args.mode == "sub_dep":
+            # Pool all trials, random split — same subject can be in train/test
             self.experiment_mode = "subject-dependent"
-            self.cross_trail = 'true'  # Split across trials (prevents clip leakage)
+            self.cross_trail = 'false'  # flatten to individual samples
         elif args.mode == "sub_indep":
+            # LOSO: train on N-1 subjects, test on 1
             self.experiment_mode = "subject-independent"
             self.cross_trail = 'true'
         else:
             raise ValueError(f"Unknown mode: {args.mode}")
 
         # Split settings
-        self.split_type = "train-val-test"
+        if args.mode == "sub_indep":
+            self.split_type = "leave-one-out"  # LOSO
+        else:
+            self.split_type = "train-val-test"  # Random trial split
         self.test_size = args.test_size
         self.val_size = args.val_size
         self.fold_num = 5
@@ -111,6 +116,29 @@ class SeedIVSetting:
         # Rounds
         self.pr = None  # Primary rounds (subjects)
         self.sr = None  # Secondary rounds
+
+
+def merge_sub_dep_pooled(data, label, setting):
+    """
+    Custom merge for sub_dep: pool ALL trials from ALL subjects/sessions into
+    one big group. Each trial is a separate item. Split happens at trial level,
+    so same subject CAN appear in both train and test, but same trial CANNOT.
+    
+    Returns: m_data = [[trial_0_samples, trial_1_samples, ...]]  (1 group, N trials)
+             m_label = [[trial_0_labels, trial_1_labels, ...]]
+    """
+    sessions = range(len(data)) if setting.sessions is None else [i - 1 for i in setting.sessions]
+    m_data = [[]]
+    m_label = [[]]
+    for i in sessions:
+        for subject in data[i]:
+            for trial in subject:
+                m_data[0].append(trial)
+    for i in sessions:
+        for subject in label[i]:
+            for trial in subject:
+                m_label[0].append(trial)
+    return m_data, m_label
 
 
 def get_data_4ch(setting):
@@ -162,16 +190,23 @@ def main(args):
     data, label, channels, feature_dim, num_classes = get_data_4ch(setting)
 
     # Restructure by experiment mode
-    data, label = merge_to_part(data, label, setting)
+    if args.mode == "sub_dep":
+        # Pool all trials into 1 group, split by trial
+        data, label = merge_sub_dep_pooled(data, label, setting)
+    else:
+        # Subject-independent: group by subject for LOSO
+        data, label = merge_to_part(data, label, setting)
 
-    print(f"\nAfter merge_to_part: {len(data)} groups")
+    print(f"\nAfter merge: {len(data)} groups")
     for i, d in enumerate(data):
         if isinstance(d, list):
-            print(f"  Group {i}: {len(d)} items")
+            print(f"  Group {i}: {len(d)} trials")
 
     device = torch.device(args.device)
     best_metrics = []
     subjects_metrics = [[] for _ in range(len(data))]
+    all_round_preds = []  # For overall confusion matrix
+    all_round_true = []
 
     for rridx, (data_i, label_i) in enumerate(zip(data, label), 1):
         tts = get_split_index(data_i, label_i, setting)
@@ -249,27 +284,78 @@ def main(args):
                 criterion=criterion
             )
 
+            # === Confusion Matrix: reload best model and evaluate on test set ===
+            best_ckpt = os.path.join(output_dir, f'checkpoint-best{args.metric_choose}')
+            if os.path.exists(best_ckpt):
+                model.load_state_dict(torch.load(best_ckpt, map_location='cpu')['model'])
+            model.to(device)
+            model.eval()
+            all_preds = []
+            all_true = []
+            with torch.no_grad():
+                for i in range(0, len(test_data), args.batch_size):
+                    batch_x = torch.Tensor(test_data[i:i+args.batch_size]).to(device)
+                    batch_y = test_label[i:i+args.batch_size]
+                    outputs = model(batch_x)
+                    preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                    # Handle one-hot labels
+                    if len(batch_y.shape) > 1:
+                        true = np.argmax(batch_y, axis=1)
+                    else:
+                        true = batch_y
+                    all_preds.extend(preds)
+                    all_true.extend(true)
+
+            from sklearn.metrics import confusion_matrix, classification_report
+            cm = confusion_matrix(all_true, all_preds, labels=list(range(num_classes)))
+            class_names = ['neutral', 'sad', 'fear', 'happy']
+            print(f"\n  Confusion Matrix (Round {rridx}.{ridx}):")
+            print(f"  {'':>10}", end="")
+            for name in class_names:
+                print(f"{name:>10}", end="")
+            print()
+            for i, name in enumerate(class_names):
+                print(f"  {name:>10}", end="")
+                for j in range(num_classes):
+                    print(f"{cm[i][j]:>10}", end="")
+                print()
+            print(f"\n  Classification Report:")
+            print(classification_report(all_true, all_preds, target_names=class_names, digits=4))
+
+            # Store predictions for overall confusion matrix
+            all_round_preds.extend(all_preds)
+            all_round_true.extend(all_true)
+
             best_metrics.append(round_metric)
-            if setting.experiment_mode == "subject-dependent":
+            if args.mode == "sub_dep":
                 subjects_metrics[rridx - 1].append(round_metric)
 
-    # Log results
+    # ============== FINAL RESULTS ==============
     print(f"\n{'='*60}")
     print("FINAL RESULTS")
     print(f"{'='*60}")
 
-    if setting.experiment_mode == "subject-dependent":
-        # Print per-subject results
-        for i, sub_metrics in enumerate(subjects_metrics):
-            if sub_metrics:
-                for m in args.metrics:
-                    values = [sm[m] for sm in sub_metrics]
-                    print(f"  Subject {i + 1}: {m} = {np.mean(values):.4f} ± {np.std(values):.4f}")
-
-    # Print overall results
+    # Print overall metrics
     for m in args.metrics:
         values = [bm[m] for bm in best_metrics]
-        print(f"\n  Overall {m}: {np.mean(values):.4f} ± {np.std(values):.4f}")
+        print(f"  Overall {m}: {np.mean(values):.4f} ± {np.std(values):.4f}")
+
+    # Print overall confusion matrix
+    from sklearn.metrics import confusion_matrix, classification_report
+    class_names = ['neutral', 'sad', 'fear', 'happy']
+    cm = confusion_matrix(all_round_true, all_round_preds, labels=list(range(num_classes)))
+    print(f"\n  Overall Confusion Matrix:")
+    print(f"  {'':>10}", end="")
+    for name in class_names:
+        print(f"{name:>10}", end="")
+    print()
+    for i, name in enumerate(class_names):
+        print(f"  {name:>10}", end="")
+        for j in range(num_classes):
+            print(f"{cm[i][j]:>10}", end="")
+        print()
+    print(f"\n  Overall Classification Report:")
+    print(classification_report(all_round_true, all_round_preds, target_names=class_names, digits=4))
 
     print(f"\nCheckpoints saved to: {os.path.join(os.path.dirname(__file__), 'checkpoints')}")
 
