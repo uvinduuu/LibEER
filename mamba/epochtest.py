@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, classification_report, confusion_matrix
 
 # Local imports
 sys.path.insert(0, os.path.dirname(__file__))
@@ -247,6 +247,24 @@ def main():
     print(f"    Accuracy : {test_acc:.4f}")
     print(f"    Macro-F1 : {test_f1:.4f}")
     print(f"{'='*60}")
+
+    # Per-class metrics
+    class_names = ['neutral', 'sad', 'fear', 'happy']
+    print(f"\n  Confusion Matrix:")
+    cm = confusion_matrix(test_labels_all, test_preds_all, labels=[0, 1, 2, 3])
+    print(f"  {'':>10}", end="")
+    for name in class_names:
+        print(f"{name:>10}", end="")
+    print()
+    for i, name in enumerate(class_names):
+        print(f"  {name:>10}", end="")
+        for j in range(4):
+            print(f"{cm[i][j]:>10}", end="")
+        print()
+
+    print(f"\n  Classification Report:")
+    print(classification_report(test_labels_all, test_preds_all,
+                                target_names=class_names, digits=4))
 
     # ── Timing summary ──
     print(f"\n  Estimated time for 100 epochs: "
