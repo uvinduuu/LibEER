@@ -260,8 +260,9 @@ def run_subject_dependent(trials, labels, subject_ids, args, device):
 
     print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
 
-    # Determine fixed length from all trials
-    fixed_length = max(t.shape[1] for t in trials)
+    # Determine fixed length from all trials (95th percentile to avoid outlier padding)
+    lengths = [t.shape[1] for t in trials]
+    fixed_length = int(np.percentile(lengths, 95))
 
     train_ds, val_ds, test_ds = make_datasets(
         trials, labels, train_idx, val_idx, test_idx, fixed_length
@@ -294,8 +295,9 @@ def run_subject_independent(trials, labels, subject_ids, args, device):
     print(f"# {len(unique_subjects)} subjects, {len(trials)} total trials")
     print(f"{'#'*60}")
 
-    # Determine fixed length from all trials
-    fixed_length = max(t.shape[1] for t in trials)
+    # Determine fixed length from all trials (95th percentile to avoid outlier padding)
+    lengths = [t.shape[1] for t in trials]
+    fixed_length = int(np.percentile(lengths, 95))
 
     all_results = []
     all_preds = []
