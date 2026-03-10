@@ -136,15 +136,18 @@ class SeedIVClipDataset(Dataset):
         if self.transform is not None:
             trial = self.transform(trial)
 
-        # Pad or crop to fixed length
+        # Record actual length before padding (for masking)
         C, T = trial.shape
+        actual_length = min(T, self.fixed_length)
+
+        # Pad or crop to fixed length
         if T < self.fixed_length:
             pad = np.zeros((C, self.fixed_length - T), dtype=trial.dtype)
             trial = np.concatenate([trial, pad], axis=1)
         elif T > self.fixed_length:
             trial = trial[:, :self.fixed_length]
 
-        return torch.from_numpy(trial), label
+        return torch.from_numpy(trial), label, actual_length
 
 
 def load_seediv_clips(dataset_path, sessions=None):

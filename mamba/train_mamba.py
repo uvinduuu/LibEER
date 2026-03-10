@@ -74,11 +74,12 @@ def evaluate(model, dataloader, device, criterion):
     n_batches = 0
 
     with torch.no_grad():
-        for batch_x, batch_y in dataloader:
+        for batch_x, batch_y, batch_lengths in dataloader:
             batch_x = batch_x.to(device)
             batch_y = torch.tensor(batch_y, dtype=torch.long).to(device) if not isinstance(batch_y, torch.Tensor) else batch_y.long().to(device)
+            batch_lengths = batch_lengths.to(device)
 
-            outputs = model(batch_x)
+            outputs = model(batch_x, lengths=batch_lengths)
             loss = criterion(outputs, batch_y)
 
             preds = torch.argmax(outputs, dim=1).cpu().numpy()
@@ -139,12 +140,13 @@ def train_one_split(
         epoch_correct = 0
         epoch_total = 0
 
-        for batch_x, batch_y in train_loader:
+        for batch_x, batch_y, batch_lengths in train_loader:
             batch_x = batch_x.to(device)
             batch_y = torch.tensor(batch_y, dtype=torch.long).to(device) if not isinstance(batch_y, torch.Tensor) else batch_y.long().to(device)
+            batch_lengths = batch_lengths.to(device)
 
             optimizer.zero_grad()
-            outputs = model(batch_x)
+            outputs = model(batch_x, lengths=batch_lengths)
             loss = criterion(outputs, batch_y)
             loss.backward()
 

@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from masked_ops import masked_global_avg_pool
+
 
 class SelectiveSSM(nn.Module):
     """
@@ -223,15 +225,29 @@ class MambaEEGClassifier(nn.Module):
             nn.Linear(d_model, num_classes),
         )
 
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         """
         Args:
             x: (B, C, T) where C=4 channels, T=raw time samples
+            lengths: (B,) optional — actual (unpadded) time-sample counts.
+                     If provided, masked average pooling is used so the model
+                     ignores zero-padded positions.
         Returns:
             logits: (B, num_classes)
         """
         # Conv stem: (B, 4, T) → (B, d_model, T')
+        # Stride 4 × stride 4 = total stride 16
         x = self.conv_stem(x)
+
+        # Scale lengths to match the downsampled sequence length T'
+        if lengths is not None:
+            # Conv stem reduces T by factor of ~16 (stride 4 * stride 4)
+            # Use ceiling division to match conv output size
+            lengths_ds = ((lengths - 1) // 16 + 1).long()
+            # Clamp to actual sequence length after conv
+            lengths_ds = lengths_ds.clamp(max=x.shape[2])
+        else:
+            lengths_ds = None
 
         # Transpose for Mamba: (B, d_model, T') → (B, T', d_model)
         x = x.transpose(1, 2)
@@ -240,8 +256,8 @@ class MambaEEGClassifier(nn.Module):
         for layer in self.mamba_layers:
             x = layer(x)
 
-        # Global average pool: (B, T', d_model) → (B, d_model)
-        x = x.mean(dim=1)
+        # Masked global average pool: (B, T', d_model) → (B, d_model)
+        x = masked_global_avg_pool(x, lengths_ds)
 
         # Classify
         logits = self.head(x)

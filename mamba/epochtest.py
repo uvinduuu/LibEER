@@ -1,5 +1,6 @@
 """
 Quick Epoch Test for Mamba EEG Classifier (SEED-IV, 4 Channels).
+WITH masked pooling — the model ignores zero-padded positions.
 
 Runs 2 epochs only — measures per-epoch wall-clock time and prints
 train/val accuracy + loss so you can sanity-check the pipeline before
@@ -41,7 +42,7 @@ def setup_seed(seed=2024):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Quick 2-epoch timing test")
+    parser = argparse.ArgumentParser(description="Quick 2-epoch timing test (with masking)")
     parser.add_argument('--dataset_path', type=str, required=True,
                         help='Path to SEED-IV root')
     parser.add_argument('--sessions', nargs='+', type=int, default=[1],
@@ -64,7 +65,7 @@ def main():
 
     # ── Load data ──
     print(f"\n{'='*60}")
-    print(f"EPOCH TEST — Mamba EEG Classifier")
+    print(f"EPOCH TEST — Mamba EEG (WITH MASKED POOLING)")
     print(f"  Dataset : {args.dataset_path}")
     print(f"  Sessions: {args.sessions}")
     print(f"  Device  : {device}")
@@ -133,13 +134,14 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\n  Model params: {n_params:,}")
+    print(f"  Masking: ENABLED (padded positions ignored in pooling)")
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
     # ── Train 2 epochs ──
     print(f"\n{'='*60}")
-    print(f"  Running 2 training epochs...")
+    print(f"  Running 2 training epochs (masked pooling)...")
     print(f"{'='*60}\n")
 
     for epoch in range(1, 3):
@@ -150,13 +152,14 @@ def main():
         epoch_total = 0
         t_start = time.time()
 
-        for batch_i, (batch_x, batch_y) in enumerate(train_loader):
+        for batch_i, (batch_x, batch_y, batch_lengths) in enumerate(train_loader):
             batch_x = batch_x.to(device)
             batch_y = batch_y.long().to(device) if isinstance(batch_y, torch.Tensor) \
                       else torch.tensor(batch_y, dtype=torch.long, device=device)
+            batch_lengths = batch_lengths.to(device)
 
             optimizer.zero_grad()
-            outputs = model(batch_x)
+            outputs = model(batch_x, lengths=batch_lengths)
             loss = criterion(outputs, batch_y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -167,8 +170,8 @@ def main():
             epoch_correct += (preds == batch_y).sum().item()
             epoch_total += len(batch_y)
 
-            # Progress every 10 batches
-            if (batch_i + 1) % 10 == 0 or batch_i == 0:
+            # Progress every 5 batches
+            if (batch_i + 1) % 5 == 0 or batch_i == 0:
                 elapsed = time.time() - t_start
                 print(f"    Epoch {epoch} | Batch {batch_i+1}/{len(train_loader)} | "
                       f"Loss: {loss.item():.4f} | "
@@ -188,11 +191,13 @@ def main():
 
         t_val = time.time()
         with torch.no_grad():
-            for batch_x, batch_y in val_loader:
+            for batch_x, batch_y, batch_lengths in val_loader:
                 batch_x = batch_x.to(device)
                 batch_y = batch_y.long().to(device) if isinstance(batch_y, torch.Tensor) \
                           else torch.tensor(batch_y, dtype=torch.long, device=device)
-                outputs = model(batch_x)
+                batch_lengths = batch_lengths.to(device)
+
+                outputs = model(batch_x, lengths=batch_lengths)
                 loss = criterion(outputs, batch_y)
                 val_loss_sum += loss.item()
                 preds = torch.argmax(outputs, dim=1)
@@ -221,11 +226,13 @@ def main():
     test_labels_all = []
 
     with torch.no_grad():
-        for batch_x, batch_y in test_loader:
+        for batch_x, batch_y, batch_lengths in test_loader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.long().to(device) if isinstance(batch_y, torch.Tensor) \
                       else torch.tensor(batch_y, dtype=torch.long, device=device)
-            outputs = model(batch_x)
+            batch_lengths = batch_lengths.to(device)
+
+            outputs = model(batch_x, lengths=batch_lengths)
             preds = torch.argmax(outputs, dim=1)
             test_correct += (preds == batch_y).sum().item()
             test_total += len(batch_y)
@@ -236,7 +243,7 @@ def main():
     test_f1 = f1_score(test_labels_all, test_preds_all, average='macro', zero_division=0)
 
     print(f"{'='*60}")
-    print(f"  TEST SET (after 2 epochs)")
+    print(f"  TEST SET (after 2 epochs, masked pooling)")
     print(f"    Accuracy : {test_acc:.4f}")
     print(f"    Macro-F1 : {test_f1:.4f}")
     print(f"{'='*60}")
