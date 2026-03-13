@@ -51,6 +51,10 @@ def split_trial_into_windows(trial, window_size, min_window_ratio=0.5):
     C, T = trial.shape
     windows = []
 
+    # Trial is shorter than one window — skip entirely
+    if T < window_size:
+        return windows
+
     n_full_windows = T // window_size
     remainder = T % window_size
 
@@ -60,11 +64,10 @@ def split_trial_into_windows(trial, window_size, min_window_ratio=0.5):
         end = start + window_size
         windows.append(trial[:, start:end])
 
-    # Handle remainder: keep if large enough, discard if too small
-    # No padding — we simply discard small remainders
-    if remainder >= int(window_size * min_window_ratio) and remainder > 0:
+    # Handle remainder: use overlapping last window if big enough
+    # Only when we already have at least one full window (ensures T >= window_size)
+    if remainder >= int(window_size * min_window_ratio) and n_full_windows > 0:
         # Take the LAST window_size samples (overlaps slightly with previous window)
-        # This avoids padding while using the remaining data
         windows.append(trial[:, T - window_size:T])
 
     return windows
