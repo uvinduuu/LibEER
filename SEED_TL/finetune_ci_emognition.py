@@ -230,7 +230,7 @@ def main():
 
     # ── Load pre-trained model ──
     print(f"\nLoading pre-trained CiMamba from: {args.pretrained}")
-    ckpt     = torch.load(args.pretrained, map_location='cpu')
+    ckpt     = torch.load(args.pretrained, map_location='cpu', weights_only=False)
     cfg      = ckpt['model_cfg']
 
     # Build model with the same encoder but NEW classifier head for Emognition
