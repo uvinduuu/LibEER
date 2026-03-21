@@ -371,17 +371,32 @@ def main():
     print(f"  Avg epoch (B)    : {np.mean(epoch_times):.1f}s")
     print_report(te_labels, te_preds, class_names, title="Emognition Test")
 
-    # Save
+    # Flush output so confusion matrix always appears before saving
+    import sys as _sys; _sys.stdout.flush()
+
+    # Save — includes model_cfg so this checkpoint can be used for further fine-tuning
     ckpt_dir  = os.path.join(os.path.dirname(__file__), 'checkpoints', 'ci_emognition')
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(ckpt_dir, 'finetuned_model.pt')
     torch.save({
-        'model':      model.state_dict(),
-        'test_acc':   te_acc,
-        'test_f1':    te_f1,
+        'model':       model.state_dict(),
+        'model_cfg': {
+            'n_channels':  cfg['n_channels'],
+            'num_classes': n_classes,
+            'd_model':     cfg['d_model'],
+            'n_layers':    cfg['n_layers'],
+            'd_state':     cfg['d_state'],
+            'dropout':     cfg['dropout'],
+            'aggregation': cfg['aggregation'],
+        },
         'class_names': class_names,
+        'test_acc':    te_acc,
+        'test_f1':     te_f1,
+        'val_f1':      best_val_f1,
+        'window_size': window_size,
     }, ckpt_path)
-    print(f"\n  Checkpoint saved: {ckpt_path}\n")
+    print(f"\n  Checkpoint saved: {ckpt_path}")
+    print(f"  (Includes model_cfg — can reload for further fine-tuning)\n")
 
 
 if __name__ == '__main__':
