@@ -140,13 +140,13 @@ def main():
     parser.add_argument('--window_sec', type=float, default=10.0)
 
     # Fine-tuning
-    parser.add_argument('--head_epochs',  type=int,   default=5,
+    parser.add_argument('--head_epochs',  type=int,   default=10,
                         help='Phase A: epochs to train head only (frozen backbone)')
     parser.add_argument('--epochs',       type=int,   default=50,
                         help='Phase B: epochs for full fine-tuning')
     parser.add_argument('--head_lr',      type=float, default=1e-3,
                         help='LR for head-only phase')
-    parser.add_argument('--finetune_lr',  type=float, default=5e-5,
+    parser.add_argument('--finetune_lr',  type=float, default=1e-4,
                         help='LR for full fine-tuning phase')
     parser.add_argument('--weight_decay', type=float, default=0.05)
     parser.add_argument('--batch_size',   type=int,   default=32)
@@ -244,12 +244,18 @@ def main():
         aggregation=cfg['aggregation'],
     )
 
-    # Load encoder weights, skip classifier head (different class count)
-    state_dict      = ckpt['model']
-    model_state     = model.state_dict()
+    # Load ENCODER weights only — always skip classifier head by name
+    # (Even if shapes match because both datasets have 4 classes,
+    #  the SEED-IV head maps wrong emotions → must reinitialize)
+    HEAD_KEYS = {'head.0.weight', 'head.0.bias',        # LayerNorm
+                 'head.2.weight', 'head.2.bias'}        # Linear
+    state_dict  = ckpt['model']
+    model_state = model.state_dict()
     matched, skipped = [], []
     for k, v in state_dict.items():
-        if k in model_state and model_state[k].shape == v.shape:
+        if any(k.startswith(hk) or k == hk for hk in HEAD_KEYS):
+            skipped.append(k)   # Always skip head — reinitialize fresh
+        elif k in model_state and model_state[k].shape == v.shape:
             model_state[k] = v
             matched.append(k)
         else:
