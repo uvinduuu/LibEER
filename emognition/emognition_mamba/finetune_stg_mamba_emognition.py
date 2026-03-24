@@ -212,7 +212,7 @@ def main():
     print(f"  Done in {time.time()-t0:.1f}s")
 
     # ── Normalize using SEED-IV stats from checkpoint ──
-    ckpt = torch.load(args.checkpoint, map_location='cpu')
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     if 'feat_mean' in ckpt and 'feat_std' in ckpt:
         feat_mean = np.array(ckpt['feat_mean'], dtype=np.float32)
         feat_std  = np.array(ckpt['feat_std'],  dtype=np.float32)
