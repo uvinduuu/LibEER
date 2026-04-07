@@ -195,7 +195,7 @@ def load_emognition_processed(
     skipped_emotion = 0
 
     for fp in files:
-        _, emotion, _ = _parse_filename(fp)
+        _, emotion = _parse_filename(fp)
         if emotion not in valid_emotions:
             skipped_emotion += 1
             continue
