@@ -543,7 +543,14 @@ def main():
 
     print(f"\n  Sequence windows ({args.seq_window}s context):")
     print(f"    Train: {len(tr_w)} windows | Val: {len(va_w)} | Test: {len(te_w)}")
-    print(f"    Train label dist: {dict(sorted(Counter(tr_y).items()))}")
+    tr_win_dist = dict(sorted(Counter(tr_y).items()))
+    print(f"    Train label dist: {tr_win_dist}")
+    # Warn about class imbalance
+    win_counts = [tr_win_dist.get(i, 1) for i in range(n_classes)]
+    imbal = max(win_counts) / min(win_counts)
+    if imbal > 1.3:
+        print(f"    [WARN] Window class imbalance ratio = {imbal:.2f}x "
+              f"— class weights will be applied to CrossEntropyLoss")
 
     # ── DataLoaders ──────────────────────────────────────────────────────────
     tr_dl = DataLoader(
@@ -588,7 +595,13 @@ def main():
     print(f"  Batches/epoch : {len(tr_dl)}")
 
     # ── Loss & Optimiser ─────────────────────────────────────────────────────
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    # Class-weighted CE to fix windowing-induced imbalance.
+    # Inverse-frequency weighting: rare classes get higher weight.
+    win_cnts  = np.array([Counter(tr_y)[i] for i in range(n_classes)], dtype=np.float32)
+    cls_wts   = (win_cnts.sum() / (n_classes * win_cnts)).clip(0.5, 3.0)
+    cls_wts_t = torch.tensor(cls_wts, device=device)
+    print(f"  Class weights : { {class_names[i]: f'{cls_wts[i]:.2f}' for i in range(n_classes)} }")
+    criterion = nn.CrossEntropyLoss(weight=cls_wts_t, label_smoothing=0.05)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.weight_decay)
     if bias_head is not None:
