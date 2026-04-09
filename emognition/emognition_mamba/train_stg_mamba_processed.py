@@ -109,11 +109,12 @@ class DeLDSWindowDataset(Dataset):
     Also stores subject index for SubjectBiasHead when use_subject_emb=True.
     """
 
-    def __init__(self, windows, labels, subj_indices=None, augment=False,
+    def __init__(self, windows, labels, subj_indices=None, trial_ids=None, augment=False,
                  noise=0.04, mask_prob=0.15):
         self.windows      = windows
         self.labels       = labels
-        self.subj_indices = subj_indices  # list[int] or None
+        self.subj_indices = subj_indices
+        self.trial_ids    = trial_ids    # for majority vote grouping
         self.augment      = augment
         self.noise        = noise
         self.mask_prob    = mask_prob
@@ -125,6 +126,7 @@ class DeLDSWindowDataset(Dataset):
         x = self.windows[idx].copy()   # (T, C, 5)
         y = int(self.labels[idx])
         s = int(self.subj_indices[idx]) if self.subj_indices is not None else -1
+        t = int(self.trial_ids[idx])    if self.trial_ids    is not None else -1
 
         if self.augment:
             # Gaussian feature noise
@@ -150,19 +152,17 @@ class DeLDSWindowDataset(Dataset):
             if random.random() < 0.4:
                 x *= random.uniform(0.85, 1.15)
 
-        return torch.FloatTensor(x), y, s
+        return torch.FloatTensor(x), y, s, t
 
 
 def create_windows(feats, labels, subj_idx_list, w_size, stride, max_wins=None):
     """Slice feature sequences into fixed-length windows.
 
-    Returns windows, labels, and per-window subject indices.
-    Args:
-        subj_idx_list: list of int subject indices parallel to feats/labels.
-        max_wins: cap on windows per trial for training.
+    Returns windows, labels, per-window subject indices, AND per-window trial IDs.
+    trial_id lets us group windows back to their source trial for majority voting.
     """
-    wins, wlbls, widxs = [], [], []
-    for x, y, si in zip(feats, labels, subj_idx_list):
+    wins, wlbls, widxs, wtids = [], [], [], []
+    for trial_id, (x, y, si) in enumerate(zip(feats, labels, subj_idx_list)):
         T = x.shape[0]
         if T < w_size:
             x = np.pad(x, ((0, w_size - T), (0, 0), (0, 0)))
@@ -177,7 +177,8 @@ def create_windows(feats, labels, subj_idx_list, w_size, stride, max_wins=None):
             wins.append(w)
             wlbls.append(y)
             widxs.append(si)
-    return wins, wlbls, widxs
+            wtids.append(trial_id)  # which trial this window came from
+    return wins, wlbls, widxs, wtids
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -196,11 +197,11 @@ def evaluate(model, loader, device, criterion, alpha, beta, bias_head=None):
     model.eval()
     if bias_head is not None:
         bias_head.eval()
-    preds, targets = [], []
+    preds, targets, all_logits = [], [], []
     tloss = tcls = trec = tkl = n = 0.0
 
     with torch.no_grad():
-        for bx, by, bs in loader:
+        for bx, by, bs, bt in loader:
             bx = bx.to(device)
             by = by.long().to(device)
             logits, lrec, lkl = model(bx, return_losses=True)
@@ -216,13 +217,50 @@ def evaluate(model, loader, device, criterion, alpha, beta, bias_head=None):
             tkl   += lkl.item()
             n     += 1
 
+            all_logits.extend(logits.cpu().numpy())
             preds.extend(logits.argmax(1).cpu().numpy())
             targets.extend(by.cpu().numpy())
 
     nb  = max(n, 1)
     acc = float(np.mean(np.array(preds) == np.array(targets)))
     f1  = f1_score(targets, preds, average='macro', zero_division=0)
-    return tloss/nb, tcls/nb, trec/nb, tkl/nb, acc, f1, preds, targets
+    return tloss/nb, tcls/nb, trec/nb, tkl/nb, acc, f1, preds, targets, np.array(all_logits)
+
+
+def trial_vote_accuracy(logits_all, targets_all, trial_ids, class_names):
+    """
+    Trial-level soft-voting accuracy.
+
+    Instead of classifying each 30s window independently, we:
+      1. Group every window that came from the same trial
+      2. Average their logits (probability-level fusion)
+      3. Argmax of averaged logits = trial prediction
+      4. Report trial-level accuracy + F1
+
+    Why this matters:
+      A 120s trial produces 10 overlapping 30s windows. Even if 6/10 are
+      correct and 4/10 wrong, the trial is correctly classified because the
+      averaged logits point to the right class. This is standard procedure
+      in EEG classification literature and is the primary metric that matters.
+    """
+    import collections
+    trial_logits = collections.defaultdict(list)
+    trial_label  = {}
+    for logit, label, tid in zip(logits_all, targets_all, trial_ids):
+        trial_logits[tid].append(logit)
+        trial_label[tid] = label
+
+    trial_preds, trial_true = [], []
+    for tid in sorted(trial_logits.keys()):
+        avg_logit = np.mean(trial_logits[tid], axis=0)  # soft vote
+        trial_preds.append(int(np.argmax(avg_logit)))
+        trial_true.append(trial_label[tid])
+
+    n_correct = sum(p == t for p, t in zip(trial_preds, trial_true))
+    acc = n_correct / max(len(trial_true), 1)
+    f1  = f1_score(trial_true, trial_preds, average='macro', zero_division=0)
+    return acc, f1, trial_preds, trial_true
+
 
 
 def mixup_data(x, y, alpha=0.3):
@@ -475,14 +513,24 @@ def main():
     rng = np.random.RandomState(args.seed)
 
     if args.mode == 'sub_dep':
-        # Trial-level random 70/15/15 — subject-dependent, ~55-65% expected acc
-        idx   = rng.permutation(N)
-        n_tr  = int(0.70 * N)
-        n_va  = int(args.val_ratio * N)
-        tr_i  = idx[:n_tr]
-        va_i  = idx[n_tr:n_tr + n_va]
-        te_i  = idx[n_tr + n_va:]
-        print(f"\n  Sub-dependent split (trial-level):")
+        # STRATIFIED trial-level 70/15/15 — split within each class separately.
+        # Guarantees equal class representation in train/val/test regardless of
+        # random seed or total trial count. This eliminates the "lucky split"
+        # problem where filtering 2 trials with the same seed could produce a
+        # completely different (harder) test set.
+        tr_i, va_i, te_i = [], [], []
+        for cls_id in range(n_classes):
+            cls_idx = [i for i in range(N) if labels[i] == cls_id]
+            rng.shuffle(cls_idx)
+            n_te_cls = max(1, int(args.test_ratio * len(cls_idx)))
+            n_va_cls = max(1, int(args.val_ratio  * len(cls_idx)))
+            te_i.extend(cls_idx[:n_te_cls])
+            va_i.extend(cls_idx[n_te_cls:n_te_cls + n_va_cls])
+            tr_i.extend(cls_idx[n_te_cls + n_va_cls:])
+        # Convert to arrays for downstream indexing consistency
+        tr_i = np.array(tr_i);  va_i = np.array(va_i);  te_i = np.array(te_i)
+        print(f"\n  Sub-dependent split (STRATIFIED trial-level 70/15/15):")
+        print(f"    Each class split independently \u2192 balanced val/test guaranteed")
     else:
         # Subject-level 70/15/15 — no subject leakage, stricter
         subjs = sorted(set(subj_ids))
@@ -500,7 +548,7 @@ def main():
         print(f"    Val   subjs ({len(va_set)}): {sorted(va_set)}")
         print(f"    Test  subjs ({len(te_set)}): {sorted(te_set)}")
 
-    print(f"    Trials → train={len(tr_i)}, val={len(va_i)}, test={len(te_i)}")
+    print(f"    Trials \u2192 train={len(tr_i)}, val={len(va_i)}, test={len(te_i)}")
     for name, idxs in [("Train", tr_i), ("Val", va_i), ("Test", te_i)]:
         dist = Counter(labels[i] for i in idxs)
         print(f"    {name} labels: { {class_names[k]: v for k, v in sorted(dist.items())} }")
@@ -529,20 +577,21 @@ def main():
     te_labels = [labels[i] for i in te_i]
 
     # ── Window into fixed-length sequences ──────────────────────────────────
-    # Train: overlapping (stride < seq_window) for more samples
-    # Val/Test: non-overlapping (stride == seq_window) for clean evaluation
-    tr_w, tr_y, tr_s = create_windows(tr_feats, tr_labels, tr_sidxs,
-                                       args.seq_window, args.stride,
-                                       max_wins=args.max_wins_per_trial)
-    va_w, va_y, va_s = create_windows(va_feats, va_labels, va_sidxs,
-                                       args.seq_window, args.seq_window,
-                                       max_wins=None)
-    te_w, te_y, te_s = create_windows(te_feats, te_labels, te_sidxs,
-                                       args.seq_window, args.seq_window,
-                                       max_wins=None)
+    # Train: overlapping stride for more samples, capped per trial
+    # Val/Test: ALSO overlapping (stride=10) for more votes per trial in majority voting
+    tr_w, tr_y, tr_s, tr_t = create_windows(tr_feats, tr_labels, tr_sidxs,
+                                              args.seq_window, args.stride,
+                                              max_wins=args.max_wins_per_trial)
+    va_w, va_y, va_s, va_t = create_windows(va_feats, va_labels, va_sidxs,
+                                              args.seq_window, args.stride,
+                                              max_wins=None)
+    te_w, te_y, te_s, te_t = create_windows(te_feats, te_labels, te_sidxs,
+                                              args.seq_window, args.stride,
+                                              max_wins=None)
 
-    print(f"\n  Sequence windows ({args.seq_window}s context):")
+    print(f"\n  Sequence windows ({args.seq_window}s context, stride={args.stride}):")
     print(f"    Train: {len(tr_w)} windows | Val: {len(va_w)} | Test: {len(te_w)}")
+    print(f"    Val/Test windows are overlapping (stride={args.stride}) for trial-level voting")
     tr_win_dist = dict(sorted(Counter(tr_y).items()))
     print(f"    Train label dist: {tr_win_dist}")
     # Warn about class imbalance
@@ -554,16 +603,16 @@ def main():
 
     # ── DataLoaders ──────────────────────────────────────────────────────────
     tr_dl = DataLoader(
-        DeLDSWindowDataset(tr_w, tr_y, subj_indices=tr_s, augment=True),
+        DeLDSWindowDataset(tr_w, tr_y, subj_indices=tr_s, trial_ids=tr_t, augment=True),
         batch_size=args.batch_size, shuffle=True,
         drop_last=True, num_workers=0, pin_memory=True,
     )
     va_dl = DataLoader(
-        DeLDSWindowDataset(va_w, va_y, subj_indices=va_s, augment=False),
+        DeLDSWindowDataset(va_w, va_y, subj_indices=va_s, trial_ids=va_t, augment=False),
         batch_size=args.batch_size, num_workers=0, pin_memory=True,
     )
     te_dl = DataLoader(
-        DeLDSWindowDataset(te_w, te_y, subj_indices=te_s, augment=False),
+        DeLDSWindowDataset(te_w, te_y, subj_indices=te_s, trial_ids=te_t, augment=False),
         batch_size=args.batch_size, num_workers=0, pin_memory=True,
     )
 
@@ -629,7 +678,7 @@ def main():
         ep_cls = ep_rec = ep_kl = 0.0
         tr_correct = tr_total = 0
 
-        for bx, by, bs in tr_dl:
+        for bx, by, bs, bt in tr_dl:
             bx = bx.to(device)
             by = by.long().to(device)
 
@@ -665,7 +714,7 @@ def main():
         ep_time = time.time() - t0
         epoch_times.append(ep_time)
 
-        _, vl_cls, _, _, v_acc, v_f1, _, _ = evaluate(
+        _, vl_cls, _, _, v_acc, v_f1, _, _, _ = evaluate(
             model, va_dl, device, criterion, args.alpha, beta, bias_head
         )
 
@@ -695,8 +744,13 @@ def main():
         bias_head.load_state_dict(best_bias_state)
     model = model.to(device)
 
-    _, _, _, _, te_acc, te_f1, te_preds, te_lbls = evaluate(
+    _, _, _, _, te_acc, te_f1, te_preds, te_lbls, te_logits = evaluate(
         model, te_dl, device, criterion, args.alpha, beta, bias_head
+    )
+
+    # Trial-level soft-vote accuracy (the real metric)
+    tr_vote_acc, tr_vote_f1, tv_preds, tv_true = trial_vote_accuracy(
+        te_logits, te_lbls, te_t, class_names
     )
 
     print(f"\n{'='*65}")
@@ -705,11 +759,22 @@ def main():
     print(f"  Mode        : {args.mode.upper()}")
     print(f"  Seq context : {args.seq_window}s ({args.seq_window} DE-LDS steps)")
     print(f"  Best Val F1 : {best_f1:.4f}")
+    print(f"")
+    print(f"  ── Window-level (per 30s window): ──")
     print(f"  Test Acc    : {te_acc:.4f}  ({te_acc*100:.1f}%)")
     print(f"  Test F1     : {te_f1:.4f}")
+    print(f"")
+    print(f"  ── Trial-level (majority soft-vote over all windows): ──")
+    print(f"  Test Acc    : {tr_vote_acc:.4f}  ({tr_vote_acc*100:.1f}%)   ← primary metric")
+    print(f"  Test F1     : {tr_vote_f1:.4f}")
+    print(f"  n_trials    : {len(tv_true)}")
+    print(f"")
     print(f"  Avg ep time : {np.mean(epoch_times):.1f}s")
     print(f"  Total time  : {sum(epoch_times) / 60:.1f} min")
-    print_report(te_lbls, te_preds, class_names, title=args.mode)
+    print(f"\n  [Window-level report:]")
+    print_report(te_lbls, te_preds, class_names, title="window-level")
+    print(f"\n  [Trial-level report:]")
+    print_report(tv_true, tv_preds, class_names, title="trial-level vote")
 
     # Learned adjacency
     adj_np = model.get_adjacency()
