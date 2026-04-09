@@ -119,17 +119,30 @@ class DeLDSWindowDataset(Dataset):
         return torch.FloatTensor(x), y
 
 
-def create_windows(feats, labels, w_size, stride):
-    """Slice (n_windows, C, 5) feature sequences into fixed-length windows."""
+def create_windows(feats, labels, w_size, stride, max_wins=None):
+    """Slice (n_windows, C, 5) feature sequences into fixed-length windows.
+
+    Args:
+        max_wins: cap on windows per trial (None = unlimited).
+                  Use this to prevent one long trial from dominating training.
+    """
     wins, wlbls = [], []
     for x, y in zip(feats, labels):
         T = x.shape[0]
         if T < w_size:
-            # Pad short trials to w_size
+            # Pad short trials to w_size (only if min_trial_sec is set low)
             x = np.pad(x, ((0, w_size - T), (0, 0), (0, 0)))
             T = w_size
+        trial_wins = []
         for s in range(0, T - w_size + 1, stride):
-            wins.append(x[s:s + w_size])
+            trial_wins.append(x[s:s + w_size])
+        # Cap windows per trial
+        if max_wins is not None and len(trial_wins) > max_wins:
+            # Sample evenly spaced windows rather than random
+            idxs = np.linspace(0, len(trial_wins) - 1, max_wins, dtype=int)
+            trial_wins = [trial_wins[i] for i in idxs]
+        for w in trial_wins:
+            wins.append(w)
             wlbls.append(y)
     return wins, wlbls
 
@@ -194,6 +207,24 @@ def print_report(y_true, y_pred, class_names, title=""):
 # ══════════════════════════════════════════════════════════════════════════════
 #  Normalisation (fit on train, apply everywhere)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def per_trial_zscore(features_list):
+    """
+    Z-score each trial INDEPENDENTLY across its own time axis.
+
+    Why: After InvBase, trials can still have very different residual scales.
+    Per-trial normalisation makes the model invariant to trial-level amplitude,
+    so it focuses on the SHAPE of spectral evolution, not the magnitude.
+    Applied before global normalisation.
+    """
+    normed = []
+    for f in features_list:
+        # f: (T, C, 5)  — normalise per band across time
+        mean = f.mean(axis=0, keepdims=True)       # (1, C, 5)
+        std  = f.std(axis=0, keepdims=True) + 1e-8 # (1, C, 5)
+        normed.append((f - mean) / std)
+    return normed
+
 
 def fit_normalizer(features_list):
     """Compute per-band mean/std from a list of (T, C, 5) arrays."""
@@ -263,9 +294,11 @@ def main():
     # ── Model ──
     parser.add_argument('--d_latent',       type=int,   default=8)
     parser.add_argument('--d_graph',        type=int,   default=24)
-    parser.add_argument('--d_mamba',        type=int,   default=64)
+    parser.add_argument('--d_mamba',        type=int,   default=128,
+                        help='Global Mamba hidden dim (default: 128, was 64)')
     parser.add_argument('--d_state',        type=int,   default=16)
-    parser.add_argument('--n_global_layers',type=int,   default=3)
+    parser.add_argument('--n_global_layers',type=int,   default=4,
+                        help='Global Mamba layers (default: 4, was 3)')
     parser.add_argument('--dropout',        type=float, default=0.4)
 
     # ── VAE losses ──
@@ -286,6 +319,21 @@ def main():
                         help='Mixup alpha (0 to disable)')
     parser.add_argument('--seed',        type=int,   default=42)
 
+    # ── Data quality ──
+    parser.add_argument('--min_trial_sec', type=float, default=30.0,
+                        help='Skip trials shorter than this (seconds). '
+                             'Prevents zero-padded garbage windows. '
+                             'Default: 30 = same as seq_window.')
+    parser.add_argument('--max_wins_per_trial', type=int, default=20,
+                        help='Cap windows per trial to prevent long trials '
+                             'from dominating training. Default: 20. '
+                             'Val/Test: uncapped for complete evaluation.')
+    parser.add_argument('--per_trial_zscore', action='store_true', default=True,
+                        help='Apply per-trial z-score before global normalisation '
+                             '(default: True). Helps when InvBase is used.')
+    parser.add_argument('--no_per_trial_zscore', dest='per_trial_zscore',
+                        action='store_false')
+
     # ── InvBase baseline removal ──
     parser.add_argument('--use_invbase', action='store_true',
                         help='Apply InvBase baseline removal: subtract each subject\'s '
@@ -305,6 +353,8 @@ def main():
     print(f"  DE-LDS   : {args.delds_win_sec}s windows, 5 bands")
     print(f"  Seq win  : {args.seq_window} DE steps ({args.seq_window}s context)")
     print(f"  Stride   : {args.stride} (train); {args.seq_window} (val/test)")
+    print(f"  Min trial: {args.min_trial_sec}s | Max wins/trial: {args.max_wins_per_trial}")
+    print(f"  Z-score  : per-trial={'YES' if args.per_trial_zscore else 'NO'}")
     print(f"  Device   : {device}")
     print(f"  Model    : d_latent={args.d_latent}, d_graph={args.d_graph}, "
           f"d_mamba={args.d_mamba}, dropout={args.dropout}")
@@ -352,9 +402,28 @@ def main():
             print("  [InvBase] No baseline files found — skipping. "
                   "Check dataset for *_BASELINE_STIMULUS_MUSE_cleaned.json files.")
 
-    N = len(features)
+    # ── Filter very short trials ──────────────────────────────────────────
+    min_de_wins = int(args.min_trial_sec / args.delds_win_sec)
+    before = len(features)
+    keep = [i for i, f in enumerate(features) if f.shape[0] >= min_de_wins]
+    features   = [features[i]   for i in keep]
+    labels     = [labels[i]     for i in keep]
+    subj_ids   = [subj_ids[i]   for i in keep]
+    N_filtered = before - len(features)
+    print(f"\n  Filtered {N_filtered} trials shorter than {args.min_trial_sec}s "
+          f"→ {len(features)} trials remain")
 
-    # ── Split ────────────────────────────────────────────────────────────────
+    N = len(features)
+    if N == 0:
+        print("[ERROR] No trials remain after filtering. Lower --min_trial_sec.")
+        sys.exit(1)
+
+    # ── Per-trial z-score (optional, recommended with InvBase) ─────────────────
+    if args.per_trial_zscore:
+        features = per_trial_zscore(features)
+        print(f"  Per-trial z-score applied")
+
+    # ── Split ───────────────────────────────────────────────────────────────────
     rng = np.random.RandomState(args.seed)
 
     if args.mode == 'sub_dep':
@@ -405,9 +474,12 @@ def main():
     # ── Window into fixed-length sequences ──────────────────────────────────
     # Train: overlapping (stride < seq_window) for more samples
     # Val/Test: non-overlapping (stride == seq_window) for clean evaluation
-    tr_w, tr_y = create_windows(tr_feats, tr_labels, args.seq_window, args.stride)
-    va_w, va_y = create_windows(va_feats, va_labels, args.seq_window, args.seq_window)
-    te_w, te_y = create_windows(te_feats, te_labels, args.seq_window, args.seq_window)
+    tr_w, tr_y = create_windows(tr_feats, tr_labels, args.seq_window, args.stride,
+                                 max_wins=args.max_wins_per_trial)
+    va_w, va_y = create_windows(va_feats, va_labels, args.seq_window, args.seq_window,
+                                 max_wins=None)  # uncapped for complete evaluation
+    te_w, te_y = create_windows(te_feats, te_labels, args.seq_window, args.seq_window,
+                                 max_wins=None)  # uncapped for complete evaluation
 
     print(f"\n  Sequence windows ({args.seq_window}s context):")
     print(f"    Train: {len(tr_w)} windows | Val: {len(va_w)} | Test: {len(te_w)}")
