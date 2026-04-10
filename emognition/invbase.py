@@ -237,3 +237,197 @@ def extract_invbase_features(X_raw, subjects, baselines, fs=FS):
           f"({n_fallback} fallback, no baseline)")
 
     return features
+
+
+# ===================== TIME-DOMAIN INVBASE APPLICATION =====================
+
+# Frequency bands used for band-filtering after InvBase
+INVBASE_BAND_HZ = [
+    ("delta", 1.0,   3.0),
+    ("theta", 4.0,   7.0),
+    ("alpha", 8.0,  13.0),
+    ("beta",  14.0, 30.0),
+    ("gamma", 31.0, 45.0),
+]
+NUM_BANDS = len(INVBASE_BAND_HZ)  # 5
+
+
+def apply_invbase_to_raw(trial, baseline_spectrum, fs=FS):
+    """
+    Apply InvBase normalization to a raw EEG trial, returning a time-domain signal.
+
+    Divides the trial's FFT amplitude by the square-root of the subject's baseline
+    power spectrum, then reconstructs via iFFT (phase is preserved).  The result
+    is a time-domain signal whose frequency content is expressed as a ratio to the
+    subject's resting-state activity — emotion-driven deviations stand out.
+
+    Different trial lengths are handled automatically via interpolation of the
+    baseline spectrum to the trial's frequency resolution.
+
+    Args:
+        trial:             (C, T) float  — raw EEG trial (C channels, T samples)
+        baseline_spectrum: (C, n_base)   — average power spectrum from
+                           load_baselines() or load_baselines_processed()
+        fs:                sampling rate in Hz (default: FS from config)
+
+    Returns:
+        normalized: (C, T) float32 — InvBase-normalized trial in time domain.
+                    Falls back to the original trial (as float32) if the baseline
+                    is None or has a channel-count mismatch.
+    """
+    C, T = trial.shape
+
+    if baseline_spectrum is None or baseline_spectrum.shape[0] != C:
+        return trial.astype(np.float32)
+
+    # FFT of the trial along the time axis
+    fft    = np.fft.rfft(trial.astype(np.float64), axis=1)  # (C, n_freq) complex
+    n_freq = fft.shape[1]
+    freqs  = np.fft.rfftfreq(T, d=1.0 / fs)                 # (n_freq,)
+
+    # Match baseline frequency bins to the trial's frequency resolution
+    n_base = baseline_spectrum.shape[1]
+    if n_base == n_freq:
+        baseline = np.maximum(baseline_spectrum.astype(np.float64), 1e-10)
+    else:
+        from scipy.interpolate import interp1d
+        old_freqs = np.linspace(0.0, fs / 2.0, n_base)
+        baseline  = np.zeros((C, n_freq), dtype=np.float64)
+        for c in range(C):
+            f_interp   = interp1d(old_freqs, baseline_spectrum[c].astype(np.float64),
+                                  kind="linear", fill_value="extrapolate")
+            baseline[c] = np.maximum(f_interp(freqs), 1e-10)
+
+    # InvBase: divided amplitude, preserved phase
+    #   normalized_amplitude = |fft| / sqrt(baseline_power)
+    #   normalized_fft       = normalized_amplitude * exp(j * phase)
+    amplitude = np.abs(fft)                           # (C, n_freq)
+    phase     = np.angle(fft)                         # (C, n_freq)
+    norm_amp  = amplitude / np.sqrt(baseline)         # (C, n_freq)
+    norm_fft  = norm_amp * np.exp(1j * phase)         # (C, n_freq) complex
+
+    normalized = np.fft.irfft(norm_fft, n=T, axis=1) # (C, T) real
+    return normalized.astype(np.float32)
+
+
+# ===================== BASELINE LOADER FOR PROCESSED (_CLEANED) DATASET =====================
+
+def load_baselines_processed(data_root, fs=FS, sample_length=None):
+    """
+    Load per-subject resting-state baselines from the cleaned/processed dataset.
+
+    Handles the nested folder format produced by the Emognition preprocessing:
+        {data_root}/{subj}/{subj}_BASELINE_STIMULUS_MUSE_cleaned/
+            {subj}_BASELINE_STIMULUS_MUSE_cleaned.json
+
+    Falls back to the original (non-cleaned) file pattern if no cleaned files
+    are found, so the function works with both dataset versions.
+
+    Args:
+        data_root:     path to the Emognition Processed dataset root.
+        fs:            sampling rate in Hz (default: 256 for Muse 2).
+        sample_length: FFT window length for spectrum estimation.
+                       Default: int(4.0 * fs) = 1024 @ 256 Hz.
+
+    Returns:
+        baselines: dict {subject_id (str): np.ndarray of shape (4, freq_bins)}
+                   Returns an empty dict if no baseline files are found.
+    """
+    if sample_length is None:
+        sample_length = int(4.0 * fs)   # 4-second windows (= 1024 @ 256 Hz)
+
+    # Glob patterns for the cleaned layout (most-specific first)
+    patterns = [
+        os.path.join(data_root, "*", "*_BASELINE_STIMULUS_MUSE_cleaned",
+                     "*_BASELINE_STIMULUS_MUSE_cleaned.json"),
+        os.path.join(data_root, "*", "*_BASELINE_STIMULUS_MUSE_cleaned.json"),
+        os.path.join(data_root, "**", "*_BASELINE_STIMULUS_MUSE_cleaned.json"),
+    ]
+    files = sorted({p for pat in patterns for p in glob.glob(pat, recursive=True)})
+
+    # Fall back to original format if nothing found
+    if not files:
+        orig_patterns = [
+            os.path.join(data_root, "*_BASELINE_STIMULUS_MUSE.json"),
+            os.path.join(data_root, "*", "*_BASELINE_STIMULUS_MUSE.json"),
+            os.path.join(data_root, "**", "*_BASELINE_STIMULUS_MUSE.json"),
+        ]
+        files = sorted({p for pat in orig_patterns
+                        for p in glob.glob(pat, recursive=True)})
+        if files:
+            print("[InvBase] Using original (non-cleaned) baseline format")
+
+    print(f"[InvBase] Found {len(files)} BASELINE files")
+
+    baselines = {}
+
+    for fp in files:
+        name       = os.path.splitext(os.path.basename(fp))[0]  # strip .json
+        subject_id = name.split("_")[0]                          # e.g. "22"
+
+        try:
+            with open(fp, "r") as f:
+                obj = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[InvBase] WARNING: Cannot read {fp}: {e}")
+            continue
+
+        # Read raw channels
+        raw = {}
+        for ch in CHANNELS:
+            raw[ch] = _interp_nan(_to_num(obj.get(ch, [])))
+
+        L = min(len(raw[ch]) for ch in CHANNELS)
+        if L < sample_length:
+            print(f"[InvBase] WARNING: Baseline too short for {subject_id} "
+                  f"({L} samples < {sample_length}), skipping")
+            continue
+
+        for ch in CHANNELS:
+            raw[ch] = raw[ch][:L]
+
+        # Quality mask: finite values + headband on + HSI ≤ 2
+        mask = np.ones(L, dtype=bool)
+        for ch in CHANNELS:
+            mask &= np.isfinite(raw[ch])
+
+        head_on = _to_num(obj.get("HeadBandOn", []))[:L]
+        if len(head_on) == L:
+            mask &= (head_on == 1)
+            for qch in QUALITY_CHANNELS:
+                hsi = _to_num(obj.get(qch, []))[:L]
+                if len(hsi) == L:
+                    mask &= np.isfinite(hsi) & (hsi <= 2)
+
+        for ch in CHANNELS:
+            raw[ch] = raw[ch][mask]
+
+        L = min(len(raw[ch]) for ch in CHANNELS)
+        if L < sample_length:
+            print(f"[InvBase] WARNING: Baseline too short after quality filter "
+                  f"for {subject_id}, skipping")
+            continue
+
+        # Stack channels, remove DC offset
+        sig = np.stack([raw[ch][:L] for ch in CHANNELS], axis=1)  # (L, 4)
+        sig = sig - np.mean(sig, axis=0, keepdims=True)
+
+        # Average power spectrum over 50%-overlapping windows
+        step    = sample_length // 2
+        spectra = []
+        for s in range(0, max(0, L - sample_length + 1), step):
+            chunk   = sig[s:s + sample_length]           # (sample_length, 4)
+            fft_c   = np.fft.rfft(chunk, axis=0)         # (freq_bins, 4)
+            spectra.append(np.abs(fft_c) ** 2)
+
+        if not spectra:
+            continue
+
+        avg_spectrum = np.mean(spectra, axis=0).T         # (4, freq_bins)
+        avg_spectrum = np.maximum(avg_spectrum, 1e-10)
+
+        baselines[subject_id] = avg_spectrum.astype(np.float64)
+
+    print(f"[InvBase] Loaded baselines for {len(baselines)} subjects: "
+          f"{sorted(baselines.keys())}")
+    return baselines
