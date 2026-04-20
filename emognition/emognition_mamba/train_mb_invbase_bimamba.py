@@ -948,11 +948,11 @@ def main():
             ep_loss = ep_n = ep_ok = ep_tot = 0
 
             for batch in tr_dl:
-                if use_bvp and len(batch) == 3:
-                    bx, bb, by = batch
+                if use_bvp and len(batch) == 4:   # (eeg, bvp, label, clip_id)
+                    bx, bb, by, _ = batch
                     bb = bb.to(device)
-                else:
-                    bx, by = batch[0], batch[-1]
+                else:                              # (eeg, label, clip_id)
+                    bx, by, _ = batch[0], batch[1], batch[2]
                     bb = None
                 bx = bx.to(device)
                 by = by.long().to(device)
