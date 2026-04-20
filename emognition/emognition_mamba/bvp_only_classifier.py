@@ -36,9 +36,11 @@ TARGET_EMOTIONS = ['ENTHUSIASM', 'FEAR', 'NEUTRAL', 'SADNESS']
 LABEL_MAP       = {e: i for i, e in enumerate(sorted(TARGET_EMOTIONS))}
 # ENTHUSIASM=0, FEAR=1, NEUTRAL=2, SADNESS=3
 
-# ── BVP signal key names to search in Samsung JSON ───────────────────────────
-BVP_KEYS = ['BVPProcessed', 'BVP', 'bvp', 'PPG', 'ppg', 'GreenChannel', 'green_channel']
-TS_KEYS  = ['Timestamp', 'timestamps', 'timestamp', 'time', 'Time']
+# ── Samsung Watch JSON keys (actual format discovered from data)
+# Each entry is [timestamp_string, value] — NOT plain floats
+BVP_KEY = 'BVPProcessed'   # filtered BVP waveform
+HR_KEY  = 'heartRate'      # instantaneous HR in bpm
+IBI_KEY = 'PPInterval'     # pulse-to-pulse interval in ms (= IBI)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,7 +48,7 @@ TS_KEYS  = ['Timestamp', 'timestamps', 'timestamp', 'time', 'Time']
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_samsung_files(data_root):
-    """Find all Samsung Watch JSON files for target emotions."""
+    """Find all STIMULUS Samsung Watch JSON files."""
     patterns = [
         os.path.join(data_root, '*_STIMULUS_SAMSUNG_WATCH.json'),
         os.path.join(data_root, '*', '*_STIMULUS_SAMSUNG_WATCH.json'),
@@ -64,153 +66,171 @@ def parse_filename(fp):
     return parts[0], parts[1].upper()
 
 
-def load_bvp_signal(fp):
+def _parse_paired_list(raw):
     """
-    Load BVP signal and estimated sampling rate from one Samsung JSON.
-    Returns (bvp_arr, fs_hz) or (None, None) on failure.
+    Parse Samsung Watch paired format: [[timestamp_str, value], ...]
+    Returns (timestamps_sec, values) as numpy arrays, or (None, None).
+    Format: timestamp like '2020-07-27T09:23:37:057716'
+    """
+    if not isinstance(raw, list) or len(raw) < 5:
+        return None, None
+    try:
+        values = np.array([row[1] for row in raw], dtype=np.float64)
+    except Exception:
+        return None, None
+
+    # Estimate timestamps in seconds from the string timestamps
+    try:
+        def ts_to_sec(ts_str):
+            # Format: '2020-07-27T09:23:37:057716'
+            # Last part after final colon is microseconds
+            parts = str(ts_str).replace('T', ':').split(':')
+            # parts: [date, hour, min, sec, microsec]
+            h, m, s = int(parts[1]), int(parts[2]), int(parts[3])
+            us = int(parts[4]) if len(parts) > 4 else 0
+            return h * 3600 + m * 60 + s + us * 1e-6
+
+        t0 = ts_to_sec(raw[0][0])
+        timestamps = np.array([ts_to_sec(row[0]) - t0 for row in raw])
+    except Exception:
+        # Fall back to uniform spacing
+        timestamps = np.arange(len(values))
+
+    return timestamps, values
+
+
+def load_samsung_signals(fp):
+    """
+    Load HR, IBI (PPInterval), and BVP signals from Samsung Watch JSON.
+
+    Returns dict with keys:
+        'ibi_ms':   numpy array of PP intervals in ms  (the IBI sequence)
+        'ibi_t':    timestamps in seconds for each IBI sample
+        'hr':       numpy array of heart rate values in bpm
+        'bvp':      numpy array of BVPProcessed signal
+        'bvp_fs':   estimated BVP sampling rate in Hz
+    Returns None if data is insufficient.
     """
     try:
         with open(fp, 'r') as f:
             obj = json.load(f)
     except Exception:
-        return None, None
+        return None
 
-    bvp = None
-    for key in BVP_KEYS:
-        if key in obj:
-            raw = obj[key]
-            if isinstance(raw, list) and len(raw) > 10:
-                try:
-                    arr = np.array(raw, dtype=np.float64)
-                    if np.isfinite(arr).mean() > 0.5:
-                        bvp = arr
-                        break
-                except Exception:
-                    continue
+    result = {}
 
-    if bvp is None:
-        return None, None
+    # ── PPInterval (IBI in ms) — most direct HRV source ──
+    if IBI_KEY in obj:
+        t, v = _parse_paired_list(obj[IBI_KEY])
+        if v is not None and len(v) >= 5:
+            # Filter physiologically valid IBIs (300–2000 ms = 30–200 bpm)
+            valid = (v > 300) & (v < 2000) & np.isfinite(v)
+            result['ibi_ms'] = v[valid]
+            result['ibi_t']  = t[valid] if t is not None else np.arange(valid.sum())
 
-    # Estimate sampling rate from timestamps
-    fs = 20.0  # default Samsung BVP sampling rate
-    for ts_key in TS_KEYS:
-        if ts_key in obj:
-            try:
-                ts = np.array(obj[ts_key], dtype=np.float64)
-                ts = ts[np.isfinite(ts)]
-                if len(ts) > 10:
-                    diffs = np.diff(ts)
-                    diffs = diffs[(diffs > 0) & (diffs < 1.0)]
-                    if len(diffs) > 5:
-                        fs = round(1.0 / np.median(diffs), 1)
-            except Exception:
-                pass
-            break
+    # ── heartRate (bpm) ──
+    if HR_KEY in obj:
+        t, v = _parse_paired_list(obj[HR_KEY])
+        if v is not None and len(v) >= 3:
+            valid = (v > 30) & (v < 220) & np.isfinite(v)
+            result['hr'] = v[valid]
 
-    # Clamp to reasonable range
-    fs = float(np.clip(fs, 15.0, 30.0))
+    # ── BVPProcessed (filtered waveform) ──
+    if BVP_KEY in obj:
+        t, v = _parse_paired_list(obj[BVP_KEY])
+        if v is not None and len(v) >= 20 and np.isfinite(v).mean() > 0.5:
+            # Estimate fs from timestamps
+            if t is not None and t[-1] > 0:
+                fs = len(v) / t[-1]
+                fs = float(np.clip(fs, 15.0, 30.0))
+            else:
+                fs = 20.0
+            # Interpolate NaNs
+            if not np.all(np.isfinite(v)):
+                idx = np.arange(len(v))
+                mask = np.isfinite(v)
+                v[~mask] = np.interp(idx[~mask], idx[mask], v[mask])
+            result['bvp']    = v
+            result['bvp_fs'] = fs
 
-    # Interpolate NaNs
-    mask = np.isfinite(bvp)
-    if mask.sum() < 20:
-        return None, None
-    if not mask.all():
-        idx = np.arange(len(bvp))
-        bvp[~mask] = np.interp(idx[~mask], idx[mask], bvp[mask])
+    # Need at least IBI or HR to be useful
+    if 'ibi_ms' not in result and 'hr' not in result:
+        return None
+    if 'ibi_ms' in result and len(result['ibi_ms']) < 4:
+        return None
 
-    return bvp, fs
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BVP feature extraction
+# HRV feature extraction (NO peak detection needed — PPInterval is direct IBI)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def bandpass(sig, lo, hi, fs, order=4):
-    """Butterworth bandpass filter."""
-    nyq = fs / 2.0
-    lo_n = max(lo / nyq, 0.01)
-    hi_n = min(hi / nyq, 0.99)
-    if lo_n >= hi_n:
-        return sig
-    sos = scipy_signal.butter(order, [lo_n, hi_n], btype='band', output='sos')
-    return scipy_signal.sosfiltfilt(sos, sig)
-
-
-def detect_peaks(bvp, fs, min_hr=40, max_hr=200):
+def extract_hrv_features(signals):
     """
-    Simple pan-tompkins-style peak detector for BVP.
-    Returns array of peak indices.
-    """
-    min_dist = int(fs * 60.0 / max_hr)
-    max_dist = int(fs * 60.0 / min_hr)
+    Extract 8 HRV features directly from PPInterval + heartRate.
 
-    filtered = bandpass(bvp, 0.7, 3.5, fs)
-    # Z-score normalise
-    std = filtered.std()
-    if std < 1e-8:
-        return np.array([], dtype=int)
-    filtered = (filtered - filtered.mean()) / std
+    Samsung Watch already provides:
+      - PPInterval : pulse-to-pulse intervals in ms  (= IBI sequence)
+      - heartRate  : instantaneous HR in bpm
 
-    peaks, props = scipy_signal.find_peaks(
-        filtered,
-        distance=min_dist,
-        height=0.3,
-    )
-    return peaks
+    No peak detection needed — far more reliable than detecting peaks
+    from the raw BVP waveform.
 
-
-def extract_hrv_features(bvp, fs):
-    """
-    Extract 8 HRV features from a BVP signal.
-
-    Returns a dict with:
+    Features:
         HR_mean   : mean heart rate (bpm)
-        HR_std    : std of instantaneous HR
-        RMSSD     : root mean square of successive IBI differences (ms)
-        pNN50     : fraction of successive diffs > 50ms
-        LF_power  : low-frequency HRV power (0.04–0.15 Hz)
-        HF_power  : high-frequency HRV power (0.15–0.4 Hz)
-        LF_HF     : LF/HF ratio
-        IBI_range : max – min IBI (ms)
+        HR_std    : std of heart rate
+        RMSSD     : sqrt(mean(diff(IBI)^2))  — parasympathetic tone
+        pNN50     : fraction of consecutive IBI diffs > 50ms
+        LF_power  : LF band HRV power (0.04–0.15 Hz) via Lomb-Scargle
+        HF_power  : HF band HRV power (0.15–0.4 Hz)
+        LF_HF     : LF/HF ratio — sympatho-vagal balance
+        IBI_range : max – min IBI (ms) — overall variability range
     """
     FAIL = {
-        'HR_mean': 70.0, 'HR_std': 5.0, 'RMSSD': 30.0,
-        'pNN50': 0.1, 'LF_power': 0.5, 'HF_power': 0.5,
-        'LF_HF': 1.0, 'IBI_range': 100.0
+        'HR_mean': 70.0, 'HR_std': 5.0,  'RMSSD': 30.0,
+        'pNN50':   0.1,  'LF_power': 0.5, 'HF_power': 0.5,
+        'LF_HF':   1.0,  'IBI_range': 100.0,
     }
 
-    peaks = detect_peaks(bvp, fs)
-    if len(peaks) < 5:
+    ibi_ms = signals.get('ibi_ms', None)
+    hr_arr = signals.get('hr',     None)
+
+    if ibi_ms is None or len(ibi_ms) < 5:
         return FAIL
 
-    # IBI sequence in milliseconds
-    ibi_ms = np.diff(peaks) / fs * 1000.0
-
-    # Remove physiologically impossible IBIs (< 300ms = 200bpm, > 2000ms = 30bpm)
-    ibi_ms = ibi_ms[(ibi_ms > 300) & (ibi_ms < 2000)]
-    if len(ibi_ms) < 4:
-        return FAIL
-
-    # Time-domain features
-    hr      = 60000.0 / ibi_ms           # instantaneous HR (bpm)
-    hr_mean = float(np.mean(hr))
-    hr_std  = float(np.std(hr))
-    rmssd   = float(np.sqrt(np.mean(np.diff(ibi_ms) ** 2)))
-    pnn50   = float(np.mean(np.abs(np.diff(ibi_ms)) > 50))
+    # ── Time-domain features from IBI ──
+    rmssd     = float(np.sqrt(np.mean(np.diff(ibi_ms) ** 2)))
+    pnn50     = float(np.mean(np.abs(np.diff(ibi_ms)) > 50))
     ibi_range = float(ibi_ms.max() - ibi_ms.min())
 
-    # Frequency-domain features using Lomb-Scargle on IBI time series
-    # (handles unevenly-sampled IBI sequences)
-    try:
-        # Timestamps of R-peaks in seconds
-        t_peaks = peaks[1:] / fs          # time of each IBI measurement
-        t_peaks_norm = t_peaks - t_peaks[0]
+    # HR from IBI (or use direct HR if available)
+    hr_from_ibi = 60000.0 / ibi_ms
+    if hr_arr is not None and len(hr_arr) >= 3:
+        hr_mean = float(np.mean(hr_arr))
+        hr_std  = float(np.std(hr_arr))
+    else:
+        hr_mean = float(np.mean(hr_from_ibi))
+        hr_std  = float(np.std(hr_from_ibi))
 
-        if t_peaks_norm[-1] > 10.0:
+    # ── Frequency-domain: Lomb-Scargle on IBI time series ──
+    try:
+        ibi_t = signals.get('ibi_t', None)
+        if ibi_t is None or len(ibi_t) != len(ibi_ms):
+            # Reconstruct timestamps from cumulative IBI
+            ibi_t = np.cumsum(ibi_ms) / 1000.0  # convert ms → seconds
+
+        ibi_t = ibi_t - ibi_t[0]   # start at 0
+        duration = ibi_t[-1]
+
+        if duration > 10.0 and len(ibi_ms) >= 8:
             freqs = np.linspace(0.01, 0.5, 500)
+            ibi_norm = ibi_ms - np.mean(ibi_ms)
             pgram = scipy_signal.lombscargle(
-                t_peaks_norm, ibi_ms - np.mean(ibi_ms),
-                2 * np.pi * freqs, normalize=True
+                ibi_t.astype(np.float64),
+                ibi_norm.astype(np.float64),
+                2 * np.pi * freqs,
+                normalize=True
             )
             lf_mask = (freqs >= 0.04) & (freqs <= 0.15)
             hf_mask = (freqs >= 0.15) & (freqs <= 0.40)
@@ -332,7 +352,7 @@ def main():
         print("   Double-check --data_root points to the Emognition raw dataset.")
         return
 
-    # ── 2. Extract BVP features per trial ────────────────────────────────────
+    # ── 2. Extract HRV features per trial ────────────────────────────────────
     X_list, y_list, subj_list = [], [], []
     feature_names = ['HR_mean', 'HR_std', 'RMSSD', 'pNN50',
                      'LF_power', 'HF_power', 'LF_HF', 'IBI_range']
@@ -343,14 +363,14 @@ def main():
         if subj is None or emot not in TARGET_EMOTIONS:
             continue
 
-        bvp, fs = load_bvp_signal(fp)
-        if bvp is None:
+        signals = load_samsung_signals(fp)
+        if signals is None:
             failed += 1
             if args.verbose:
-                print(f"  [skip] {os.path.basename(fp)} — no BVP signal")
+                print(f"  [skip] {os.path.basename(fp)} — no usable signals")
             continue
 
-        feats = extract_hrv_features(bvp, fs)
+        feats = extract_hrv_features(signals)
         feat_vec = np.array([feats[k] for k in feature_names], dtype=np.float32)
 
         # Guard against Infs/NaNs
