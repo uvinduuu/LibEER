@@ -338,11 +338,29 @@ class MBInvBaseBiMamba(nn.Module):
         ])
 
         # (e) Classifier head
+        self.d_model = d_model          # expose for MultimodalMBModel
         self.head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Dropout(dropout),
             nn.Linear(d_model, num_classes),
         )
+
+    def _encode(self, x: torch.Tensor, lengths=None) -> torch.Tensor:
+        """Run all layers except the classifier. Returns (B, d_model) embedding."""
+        x = self.channel_attn(x)               # (B, 20, T)
+        x = self.conv_stem(x)                  # (B, d_model, T//16)
+        if lengths is not None:
+            lengths_ds = ((lengths - 1) // 16 + 1).long().clamp(max=x.shape[2])
+        else:
+            lengths_ds = None
+        x = x.transpose(1, 2)                  # (B, T//16, d_model)
+        for layer in self.bi_layers:
+            x = layer(x)
+        return masked_avg_pool(x, lengths_ds)   # (B, d_model)
+
+    def get_embedding(self, x: torch.Tensor, lengths=None) -> torch.Tensor:
+        """Return d_model-dim embedding (before classifier). Used by BVP fusion."""
+        return self._encode(x, lengths)
 
     def forward(self, x: torch.Tensor, lengths=None) -> torch.Tensor:
         """
@@ -353,28 +371,7 @@ class MBInvBaseBiMamba(nn.Module):
         Returns:
             logits: (B, num_classes)
         """
-        # (a) Channel attention
-        x = self.channel_attn(x)               # (B, 20, T)
-
-        # (b) Conv stem → downsample
-        x = self.conv_stem(x)                  # (B, d_model, T//16)
-
-        # Scale 'lengths' to the downsampled time dimension
-        if lengths is not None:
-            lengths_ds = ((lengths - 1) // 16 + 1).long().clamp(max=x.shape[2])
-        else:
-            lengths_ds = None
-
-        # (c) BiMamba blocks
-        x = x.transpose(1, 2)                  # (B, T//16, d_model)
-        for layer in self.bi_layers:
-            x = layer(x)
-
-        # (d) Masked global average pool
-        x = masked_avg_pool(x, lengths_ds)     # (B, d_model)
-
-        # (e) Classify
-        return self.head(x)                    # (B, num_classes)
+        return self.head(self._encode(x, lengths))    # (B, num_classes)
 
 
 # ── quick sanity check ───────────────────────────────────────────────────────

@@ -1,36 +1,38 @@
 """
 train_mb_invbase_bimamba.py
 ===========================
-Multi-Band InvBase BiMamba — Subject-Independent Training for Emognition.
+Multi-Band InvBase BiMamba — Multimodal Emognition Training.
 
-Full pipeline:
-  1. Load variable-length raw EEG trials (emognition_processed_loader)
-  2. Load per-subject baseline spectra  (invbase.load_baselines_processed)
-  3. Per-trial pre-processing
-       a. Clip artefacts: ±5 σ per channel
-       b. InvBase normalization (time-domain, phase-preserving)
-       c. 5-band Butterworth bandpass filter → stack → (20, T)
-  4. Subject-independent 70/15/15 split (disjoint subjects in each set)
-  5. Window trials into fixed-size chunks
-       • Train: 50 % overlap (more samples, heavier augmentation)
-       • Val / Test: no overlap (clean evaluation)
-  6. Train MBInvBaseBiMamba with:
-       • AdamW + warmup-cosine LR schedule
-       • Label smoothing cross-entropy
-       • Gradient clipping
-  7. Evaluate on test set, print confusion matrix + per-class F1
+Supports two evaluation modes:
+  --mode loso       : Leave-One-Subject-Out (default, strictest)
+  --mode sub_indep  : 70/15/15 subject-independent split
 
-Usage (Kaggle / local):
+BVP Fusion (Samsung Watch):
+  By default, 4 clip-level HRV features [HR_mean, RMSSD, pNN50, IBI_range]
+  are loaded from Samsung Watch JSONs and concatenated to the EEG embedding
+  before the classifier head. Disable with --no_bvp.
+
+Anti-overfitting:
+  Label smoothing (0.20), Dropout (0.55), Weight decay (0.05),
+  Band dropout + time masking augmentation, Early stopping, LOSO.
+
+Usage (Kaggle):
+    # Multimodal LOSO (recommended):
     python train_mb_invbase_bimamba.py \\
-        --data_root /kaggle/input/emognition-processed/Emognition\\ Processed \\
-        --epochs 150 --d_model 64 --n_layers 3 --dropout 0.5 --seed 42
+        --data_root /kaggle/input/.../emognition \\
+        --samsung_root /kaggle/input/.../emognition \\
+        --mode loso --epochs 120
 
-    # Quick smoke-test (8 trials, 50 epochs):
-    python train_mb_invbase_bimamba.py --data_root ... --overfit_test
+    # EEG-only ablation:
+    python train_mb_invbase_bimamba.py \\
+        --data_root /kaggle/input/.../emognition \\
+        --mode loso --no_bvp --epochs 120
 """
 
 import os
 import sys
+import glob
+import json
 import math
 import time
 import random
@@ -244,68 +246,184 @@ def window_trials(processed_trials, labels, subject_ids,
 #  PyTorch Dataset
 # ════════════════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════════════════
+#  BVP / Samsung Watch Feature Extraction
+# ════════════════════════════════════════════════════════════════════════════
+
+BVP_DIM      = 4                    # [HR_mean, RMSSD, pNN50, IBI_range]
+TARGET_EMOT  = {'ENTHUSIASM', 'FEAR', 'NEUTRAL', 'SADNESS'}
+
+
+def _parse_paired(raw):
+    """[[timestamp, value], ...] → numpy 1-D array of values."""
+    if not isinstance(raw, list) or len(raw) < 5:
+        return None
+    try:
+        return np.array([r[1] for r in raw], dtype=np.float64)
+    except Exception:
+        return None
+
+
+def load_bvp_features_one(fp):
+    """
+    Extract 4 HRV features from one Samsung Watch STIMULUS JSON.
+    Returns float32 array [HR_mean, RMSSD, pNN50, IBI_range] or None.
+    """
+    try:
+        with open(fp) as f:
+            obj = json.load(f)
+    except Exception:
+        return None
+
+    ibi = _parse_paired(obj.get('PPInterval'))
+    hr  = _parse_paired(obj.get('heartRate'))
+
+    if ibi is not None:
+        ibi = ibi[(ibi > 300) & (ibi < 2000) & np.isfinite(ibi)]
+    if hr is not None:
+        hr  = hr[(hr > 30)   & (hr  < 220)  & np.isfinite(hr)]
+
+    if ibi is None or len(ibi) < 5:
+        return None
+
+    hr_mean   = float(np.mean(hr))   if (hr is not None and len(hr) >= 3) \
+                else float(np.mean(60000.0 / ibi))
+    rmssd     = float(np.sqrt(np.mean(np.diff(ibi) ** 2)))
+    pnn50     = float(np.mean(np.abs(np.diff(ibi)) > 50))
+    ibi_range = float(ibi.max() - ibi.min())
+
+    feat = np.array([hr_mean, rmssd, pnn50, ibi_range], dtype=np.float32)
+    return feat if np.all(np.isfinite(feat)) else None
+
+
+def build_bvp_lookup(samsung_root):
+    """
+    Scan samsung_root for *_STIMULUS_SAMSUNG_WATCH.json and build
+    dict: (subject_str, EMOTION_STR) → float32[4].
+    """
+    patterns = [
+        os.path.join(samsung_root, '*_STIMULUS_SAMSUNG_WATCH.json'),
+        os.path.join(samsung_root, '*', '*_STIMULUS_SAMSUNG_WATCH.json'),
+        os.path.join(samsung_root, '**', '*_STIMULUS_SAMSUNG_WATCH.json'),
+    ]
+    files = sorted({p for pat in patterns for p in glob.glob(pat, recursive=True)})
+
+    lookup = {}
+    n_ok = n_fail = 0
+    for fp in files:
+        name  = os.path.splitext(os.path.basename(fp))[0].split('_')
+        if len(name) < 2:
+            continue
+        subj, emot = name[0], name[1].upper()
+        if emot not in TARGET_EMOT:
+            continue
+        feat = load_bvp_features_one(fp)
+        if feat is not None:
+            lookup[(subj, emot)] = feat
+            n_ok += 1
+        else:
+            n_fail += 1
+
+    print(f"  BVP lookup: {n_ok} loaded, {n_fail} failed "
+          f"({len(set(s for s,_ in lookup))} subjects)")
+    return lookup
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Multimodal Model Wrapper
+# ════════════════════════════════════════════════════════════════════════════
+
+class MultimodalMBModel(nn.Module):
+    """
+    Wraps MBInvBaseBiMamba and concatenates BVP features before
+    the final classification head.
+
+    EEG embedding (d_model) → concat [HR_mean, RMSSD, pNN50, IBI_range]
+    → LayerNorm → Dropout(0.5) → Linear(d_model+4 → 32) → ELU
+    → Dropout(0.3) → Linear(32 → n_classes)
+    """
+    def __init__(self, backbone: MBInvBaseBiMamba, bvp_dim: int, n_classes: int,
+                 dropout: float = 0.5):
+        super().__init__()
+        self.backbone = backbone
+        self.bvp_dim  = bvp_dim
+        d_emb         = backbone.d_model         # embedding dimension
+
+        # Remove backbone's original head; replace with multimodal one
+        in_dim = d_emb + bvp_dim
+        self.head = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Dropout(dropout),
+            nn.Linear(in_dim, 32),
+            nn.ELU(),
+            nn.Dropout(dropout * 0.6),
+            nn.Linear(32, n_classes),
+        )
+
+    def forward(self, x_eeg, x_bvp=None):
+        """
+        x_eeg : (B, 20, T)
+        x_bvp : (B, 4)  or None
+        """
+        emb = self.backbone.get_embedding(x_eeg)   # (B, d_model)
+        if self.bvp_dim > 0 and x_bvp is not None:
+            emb = torch.cat([emb, x_bvp], dim=-1)  # (B, d_model+4)
+        return self.head(emb)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Dataset
+# ════════════════════════════════════════════════════════════════════════════
+
 class EmognitionMBDataset(Dataset):
     """
-    Dataset of fixed-size (20, window_size) EEG windows.
-
-    Optional augmentations (training only):
-      • Gaussian noise     — adds small zero-mean noise scaled to signal std
-      • Amplitude scaling  — multiplies all channels by a random scalar
-      • Band dropout       — zeros one entire band (4 channels) with prob p
-      • Time masking       — zeros one random time segment
+    Dataset of (20, window_size) EEG windows + optional BVP feature vector.
+    Augmentations applied only when augment=True (training).
     """
 
-    def __init__(self, windows, labels, augment: bool = False,
+    def __init__(self, windows, labels, bvp_feats=None, augment: bool = False,
                  noise_ratio: float = 0.03,
                  scale_range: tuple = (0.85, 1.15),
                  band_drop_p: float = 0.15,
                  time_mask_p: float = 0.40,
                  time_mask_frac: float = 0.10):
-        self.windows       = windows
-        self.labels        = labels
-        self.augment       = augment
-        self.noise_ratio   = noise_ratio
-        self.scale_range   = scale_range
-        self.band_drop_p   = band_drop_p
-        self.time_mask_p   = time_mask_p
+        self.windows        = windows
+        self.labels         = labels
+        self.bvp_feats      = (torch.tensor(np.array(bvp_feats), dtype=torch.float32)
+                               if bvp_feats is not None else None)
+        self.augment        = augment
+        self.noise_ratio    = noise_ratio
+        self.scale_range    = scale_range
+        self.band_drop_p    = band_drop_p
+        self.time_mask_p    = time_mask_p
         self.time_mask_frac = time_mask_frac
 
     def __len__(self):
         return len(self.windows)
 
     def __getitem__(self, idx):
-        x     = self.windows[idx].copy()   # (20, window_size)
+        x     = self.windows[idx].copy()
         label = self.labels[idx]
-
         if self.augment:
             x = self._augment(x)
-
-        return torch.from_numpy(x), label
+        x_t = torch.from_numpy(x)
+        if self.bvp_feats is not None:
+            return x_t, self.bvp_feats[idx], label
+        return x_t, label
 
     def _augment(self, x: np.ndarray) -> np.ndarray:
-        """Apply random augmentations to (20, T) window."""
-        # 1. Gaussian noise (always applied in training)
         σ = x.std()
         if σ > 1e-8:
-            x = x + (np.random.randn(*x.shape).astype(np.float32)
-                     * σ * self.noise_ratio)
-
-        # 2. Amplitude scaling  (single scalar — preserves relative channel ratios)
-        scale = np.random.uniform(*self.scale_range)
-        x     = x * scale
-
-        # 3. Band dropout — zero one full band (all 4 channels of that band)
+            x = x + np.random.randn(*x.shape).astype(np.float32) * σ * self.noise_ratio
+        x = x * np.random.uniform(*self.scale_range)
         if np.random.random() < self.band_drop_p:
-            band_idx = np.random.randint(0, NUM_BANDS)
-            x[band_idx * 4:(band_idx + 1) * 4, :] = 0.0
-
-        # 4. Time masking — zero a contiguous time segment
+            b = np.random.randint(0, NUM_BANDS)
+            x[b*4:(b+1)*4, :] = 0.0
         if np.random.random() < self.time_mask_p:
-            T        = x.shape[1]
-            mask_len = max(1, int(T * self.time_mask_frac))
-            start    = np.random.randint(0, max(T - mask_len, 1) + 1)
-            x[:, start:start + mask_len] = 0.0
-
+            T   = x.shape[1]
+            ml  = max(1, int(T * self.time_mask_frac))
+            s   = np.random.randint(0, max(T - ml, 1) + 1)
+            x[:, s:s+ml] = 0.0
         return x
 
 
@@ -372,22 +490,28 @@ def setup_seed(seed: int):
 #  Evaluation
 # ════════════════════════════════════════════════════════════════════════════
 
-def evaluate(model, loader, device, criterion):
+def evaluate(model, loader, device, criterion, use_bvp=False):
     """Evaluate model. Returns (loss, accuracy, macro-F1, preds, labels)."""
     model.eval()
     all_preds, all_labels = [], []
     total_loss, n_batches = 0.0, 0
 
     with torch.no_grad():
-        for bx, by in loader:
-            bx  = bx.to(device)
-            by  = (by.long().to(device) if isinstance(by, torch.Tensor)
-                   else torch.tensor(by, dtype=torch.long, device=device))
-            out = model(bx)
+        for batch in loader:
+            if use_bvp and len(batch) == 3:
+                bx, bb, by = batch
+                bb = bb.to(device)
+            else:
+                bx, by = batch[0], batch[-1]
+                bb = None
+            bx = bx.to(device)
+            by = (by.long().to(device) if isinstance(by, torch.Tensor)
+                  else torch.tensor(by, dtype=torch.long, device=device))
+            out = model(bx, bb) if use_bvp else model(bx)
             total_loss += criterion(out, by).item()
             all_preds.extend(torch.argmax(out, 1).cpu().numpy())
             all_labels.extend(by.cpu().numpy())
-            n_batches  += 1
+            n_batches += 1
 
     acc = np.mean(np.array(all_preds) == np.array(all_labels))
     f1  = f1_score(all_labels, all_preds, average="macro", zero_division=0)
@@ -419,72 +543,74 @@ def print_report(y_true, y_pred, title: str = ""):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MB-InvBase-BiMamba — Emognition Subject-Independent Training"
+        description="MB-InvBase-BiMamba — Multimodal Emognition Training (LOSO)"
     )
 
     # ── data ──
-    parser.add_argument("--data_root", required=True,
-                        help="Path to Emognition Processed dataset root")
-    parser.add_argument("--emotions", nargs="+",
-                        default=["ENTHUSIASM", "FEAR", "NEUTRAL", "SADNESS"],
-                        help="Emotion classes to use (default: 4-class)")
-    parser.add_argument("--min_trial_sec", type=float, default=5.0,
-                        help="Minimum trial length in seconds (shorter skipped)")
+    parser.add_argument("--data_root",    required=True,
+                        help="Emognition Processed dataset root (EEG JSON files)")
+    parser.add_argument("--samsung_root", default=None,
+                        help="Samsung Watch data root (default: same as data_root)")
+    parser.add_argument("--no_bvp",       action="store_true",
+                        help="Disable BVP fusion — run EEG-only ablation")
+    parser.add_argument("--emotions",     nargs="+",
+                        default=["ENTHUSIASM", "FEAR", "NEUTRAL", "SADNESS"])
+    parser.add_argument("--min_trial_sec",type=float, default=5.0)
+
+    # ── evaluation mode ──
+    parser.add_argument("--mode", choices=["loso", "sub_indep"],
+                        default="loso",
+                        help="loso = leave-one-subject-out (default)")
 
     # ── windowing ──
-    parser.add_argument("--window_sec", type=float, default=10.0,
-                        help="Window length in seconds (default: 10)")
-    parser.add_argument("--val_size", type=float, default=0.15,
-                        help="Fraction of subjects for validation (default: 0.15)")
-    parser.add_argument("--test_size", type=float, default=0.15,
-                        help="Fraction of subjects for test (default: 0.15)")
+    parser.add_argument("--window_sec",   type=float, default=10.0)
+    parser.add_argument("--val_size",     type=float, default=0.15)
+    parser.add_argument("--test_size",    type=float, default=0.15)
 
-    # ── model ──
-    parser.add_argument("--d_model",  type=int,   default=64)
-    parser.add_argument("--n_layers", type=int,   default=3)
-    parser.add_argument("--d_state",  type=int,   default=16)
-    parser.add_argument("--dropout",  type=float, default=0.5)
-    parser.add_argument("--attn_reduction", type=int, default=4)
+    # ── model (reduced defaults to fight overfitting) ──
+    parser.add_argument("--d_model",         type=int,   default=32)
+    parser.add_argument("--n_layers",        type=int,   default=2)
+    parser.add_argument("--d_state",         type=int,   default=16)
+    parser.add_argument("--dropout",         type=float, default=0.55)
+    parser.add_argument("--attn_reduction",  type=int,   default=4)
 
     # ── training ──
-    parser.add_argument("--batch_size",    type=int,   default=16)
-    parser.add_argument("--epochs",        type=int,   default=150)
-    parser.add_argument("--lr",            type=float, default=2e-4)
+    parser.add_argument("--batch_size",    type=int,   default=32)
+    parser.add_argument("--epochs",        type=int,   default=120)
+    parser.add_argument("--lr",            type=float, default=1e-4)
     parser.add_argument("--weight_decay",  type=float, default=0.05)
     parser.add_argument("--warmup_epochs", type=int,   default=5)
-    parser.add_argument("--label_smooth",  type=float, default=0.1)
-    parser.add_argument("--patience",      type=int,   default=30,
-                        help="Early stopping patience (0 = disabled)")
+    parser.add_argument("--label_smooth",  type=float, default=0.20)
+    parser.add_argument("--patience",      type=int,   default=25)
 
     # ── misc ──
     parser.add_argument("--seed",    type=int,  default=42)
     parser.add_argument("--device",  type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--overfit_test", action="store_true",
-                        help="Quick sanity check: train on 8 trials → expect >90 %%")
-    parser.add_argument("--save_dir", type=str, default=None,
-                        help="Directory for model checkpoints (default: ./checkpoints)")
+    parser.add_argument("--overfit_test", action="store_true")
+    parser.add_argument("--save_dir", type=str, default=None)
 
     args = parser.parse_args()
     setup_seed(args.seed)
-    device = torch.device(args.device)
-
-    window_size = int(args.window_sec * FS)
-    save_dir    = args.save_dir or os.path.join(_SCRIPT_DIR, "checkpoints",
-                                                "mb_invbase_bimamba")
+    device        = torch.device(args.device)
+    window_size   = int(args.window_sec * FS)
+    samsung_root  = args.samsung_root or args.data_root
+    use_bvp       = not args.no_bvp
+    save_dir      = args.save_dir or os.path.join(_SCRIPT_DIR, "checkpoints",
+                                                  "mb_invbase_bimamba")
     os.makedirs(save_dir, exist_ok=True)
 
     print(f"\n{'='*70}")
-    print(f"  MB-InvBase-BiMamba  /  Emognition  /  Subject-Independent")
+    print(f"  MB-InvBase-BiMamba  /  Emognition  /  {args.mode.upper()}")
     print(f"{'='*70}")
     print(f"  data_root   : {args.data_root}")
-    print(f"  emotions    : {args.emotions}")
-    print(f"  window      : {args.window_sec}s  →  {window_size} samples"
-          f"  →  {window_size // 16} Mamba steps")
+    print(f"  BVP fusion  : {'✅ ON' if use_bvp else '❌ OFF (EEG-only)'}")
+    print(f"  mode        : {args.mode}")
+    print(f"  window      : {args.window_sec}s → {window_size} samples")
     print(f"  model       : d_model={args.d_model}, n_layers={args.n_layers},"
-          f" d_state={args.d_state}, dropout={args.dropout}")
+          f" dropout={args.dropout}")
     print(f"  training    : lr={args.lr}, wd={args.weight_decay},"
-          f" warmup={args.warmup_epochs}, smooth={args.label_smooth}")
+          f" smooth={args.label_smooth}, patience={args.patience}")
     print(f"  device      : {device}")
     print(f"{'='*70}\n")
 
@@ -570,80 +696,161 @@ def main():
         print(f"  Overfit test: {status}")
         return
 
-    # ── 4. Subject-independent split ─────────────────────────────────────────
-    print("Step 4 — Subject-independent split (70/15/15)...")
-    train_subjs, val_subjs, test_subjs = subject_split(
-        subject_ids, seed=args.seed,
-        val_frac=args.val_size, test_frac=args.test_size
-    )
-    print(f"  Train subjects ({len(train_subjs)}): {sorted(train_subjs)}")
-    print(f"  Val   subjects ({len(val_subjs)}): {sorted(val_subjs)}")
-    print(f"  Test  subjects ({len(test_subjs)}): {sorted(test_subjs)}")
-    print(f"  Overlap check: ✓ zero overlap\n")
+    # ── 4. BVP lookup ────────────────────────────────────────────────────────
+    bvp_lookup = None
+    bvp_mean   = bvp_std = None
+    emot_strs  = [id2lab[l] for l in labels]   # emotion string per trial
 
-    def gather(subj_set):
-        idx = [i for i, s in enumerate(subject_ids) if s in subj_set]
-        return ([processed_trials[i] for i in idx],
-                [labels[i]           for i in idx],
-                [subject_ids[i]      for i in idx])
+    if use_bvp:
+        print("Step 4 — Loading Samsung Watch BVP features...")
+        bvp_lookup = build_bvp_lookup(samsung_root)
+        # Global BVP normalisation stats (across all trials)
+        vecs = [bvp_lookup.get((s, e)) for s, e in zip(subject_ids, emot_strs)
+                if bvp_lookup.get((s, e)) is not None]
+        if vecs:
+            arr       = np.stack(vecs)
+            bvp_mean  = arr.mean(0).astype(np.float32)
+            bvp_std   = (arr.std(0) + 1e-8).astype(np.float32)
+            print(f"  BVP stats: mean={bvp_mean.round(2)}, std={bvp_std.round(2)}")
+        print()
 
-    tr_proc, tr_lbl, tr_sub = gather(train_subjs)
-    va_proc, va_lbl, va_sub = gather(val_subjs)
-    te_proc, te_lbl, te_sub = gather(test_subjs)
+    def get_bvp_per_window(subj_list, emot_str_list, n_wins_list):
+        """Replicate clip-level BVP feature for every window of that clip."""
+        if not use_bvp or bvp_lookup is None:
+            return None
+        out = []
+        for subj, emot, nw in zip(subj_list, emot_str_list, n_wins_list):
+            vec = bvp_lookup.get((subj, emot), np.zeros(BVP_DIM, np.float32))
+            if bvp_mean is not None:
+                vec = (vec - bvp_mean) / bvp_std
+            out.extend([vec] * nw)
+        return out
 
-    # ── 5. Window trials ─────────────────────────────────────────────────────
-    print("Step 5 — Windowing trials...")
-    step_train = window_size // 2    # 50 % overlap for train
-    step_eval  = window_size         # no overlap for val / test
+    def run_one_split(tr_proc, tr_lbl, tr_sub, tr_emot,
+                      va_proc, va_lbl, va_sub, va_emot,
+                      te_proc, te_lbl, te_sub, te_emot,
+                      fold_name=""):
+        """
+        Build loaders, create model, train, and return test metrics.
+        Returns (te_acc, te_f1, te_preds, te_labels).
+        """
+        step_tr = window_size // 2
+        step_ev = window_size
 
-    tr_wins, tr_wlbls, _ = window_trials(tr_proc, tr_lbl, tr_sub,
-                                          window_size, step_train)
-    va_wins, va_wlbls, _ = window_trials(va_proc, va_lbl, va_sub,
-                                          window_size, step_eval)
-    te_wins, te_wlbls, _ = window_trials(te_proc, te_lbl, te_sub,
-                                          window_size, step_eval)
+        tr_wins, tr_wlbls, tr_wsubs = window_trials(
+            tr_proc, tr_lbl, tr_sub, window_size, step_tr)
+        va_wins, va_wlbls, va_wsubs = window_trials(
+            va_proc, va_lbl, va_sub, window_size, step_ev)
+        te_wins, te_wlbls, te_wsubs = window_trials(
+            te_proc, te_lbl, te_sub, window_size, step_ev)
 
-    print(f"  Train windows : {len(tr_wins)}")
-    print(f"  Val   windows : {len(va_wins)}")
-    print(f"  Test  windows : {len(te_wins)}")
+        # Count windows per trial for BVP replication
+        def count_wins(proc, step):
+            return [len(list(range(0, max(t.shape[1]-window_size+1,1), step)))
+                    for t in proc]
 
-    # Class balance check
-    for split_name, wlbls in [("Train", tr_wlbls), ("Val", va_wlbls),
-                               ("Test",  te_wlbls)]:
-        dist = Counter(wlbls)
-        dist_str = ", ".join(f"{id2lab[k]}:{dist[k]}" for k in sorted(dist))
-        print(f"  {split_name} class dist: {dist_str}")
+        tr_bvp = get_bvp_per_window(tr_sub, tr_emot, count_wins(tr_proc, step_tr))
+        va_bvp = get_bvp_per_window(va_sub, va_emot, count_wins(va_proc, step_ev))
+        te_bvp = get_bvp_per_window(te_sub, te_emot, count_wins(te_proc, step_ev))
+
+        if fold_name:
+            print(f"  Windows: tr={len(tr_wins)}, va={len(va_wins)}, te={len(te_wins)}")
+
+        tr_ds = EmognitionMBDataset(tr_wins, tr_wlbls, tr_bvp, augment=True)
+        va_ds = EmognitionMBDataset(va_wins, va_wlbls, va_bvp, augment=False)
+        te_ds = EmognitionMBDataset(te_wins, te_wlbls, te_bvp, augment=False)
+
+        tr_dl = DataLoader(tr_ds, args.batch_size, shuffle=True,
+                           drop_last=False, num_workers=0, pin_memory=True)
+        va_dl = DataLoader(va_ds, args.batch_size, shuffle=False,
+                           num_workers=0, pin_memory=True)
+        te_dl = DataLoader(te_ds, args.batch_size, shuffle=False,
+                           num_workers=0, pin_memory=True)
+
+        # Build model fresh for each fold
+        backbone = MBInvBaseBiMamba(
+            in_channels=IN_CHANNELS, num_classes=NUM_CLASSES,
+            d_model=args.d_model,    n_layers=args.n_layers,
+            d_state=args.d_state,    dropout=args.dropout,
+            attn_reduction=args.attn_reduction,
+        )
+        if use_bvp:
+            fold_model = MultimodalMBModel(
+                backbone, BVP_DIM, NUM_CLASSES, dropout=args.dropout
+            ).to(device)
+        else:
+            fold_model = backbone.to(device)
+
+        crit      = LabelSmoothingCE(NUM_CLASSES, args.label_smooth)
+        eval_crit = nn.CrossEntropyLoss()
+        opt       = optim.AdamW(fold_model.parameters(), lr=args.lr,
+                                weight_decay=args.weight_decay, eps=1e-8)
+        sched     = WarmupCosineScheduler(opt, args.warmup_epochs,
+                                          args.epochs, min_lr=1e-7)
+
+        best_f1 = 0.0; best_st = None; pat_ctr = 0
+
+        for epoch in range(1, args.epochs + 1):
+            fold_model.train()
+            ep_loss = ep_n = ep_ok = ep_tot = 0
+
+            for batch in tr_dl:
+                if use_bvp and len(batch) == 3:
+                    bx, bb, by = batch
+                    bb = bb.to(device)
+                else:
+                    bx, by = batch[0], batch[-1]
+                    bb = None
+                bx = bx.to(device)
+                by = by.long().to(device)
+                opt.zero_grad()
+                out  = fold_model(bx, bb) if use_bvp else fold_model(bx)
+                loss = crit(out, by)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(fold_model.parameters(), 1.0)
+                opt.step()
+                ep_loss += loss.item(); ep_n += 1
+                ep_ok   += (out.argmax(1) == by).sum().item()
+                ep_tot  += len(by)
+
+            sched.step()
+            _, va_acc, va_f1, _, _ = evaluate(fold_model, va_dl, device,
+                                               eval_crit, use_bvp)
+
+            if epoch % 10 == 0 or epoch == 1:
+                tr_acc = ep_ok / max(ep_tot, 1)
+                print(f"  {fold_name} Ep{epoch:3d} | "
+                      f"Tr:{tr_acc:.3f} | Va:{va_acc:.3f} F1:{va_f1:.3f} | "
+                      f"lr:{sched.get_last_lr()[0]:.1e}")
+
+            if va_f1 > best_f1:
+                best_f1 = va_f1
+                best_st = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
+                pat_ctr = 0
+            else:
+                pat_ctr += 1
+                if args.patience > 0 and pat_ctr >= args.patience:
+                    print(f"  Early stop at epoch {epoch}")
+                    break
+
+        if best_st:
+            fold_model.load_state_dict(best_st)
+            fold_model = fold_model.to(device)
+
+        _, te_acc, te_f1, te_preds, te_lbls = evaluate(
+            fold_model, te_dl, device, eval_crit, use_bvp)
+        return te_acc, te_f1, te_preds, te_lbls
+
+    # ── 5+6+7: Split, window, train ──────────────────────────────────────────
+    n_params_est = sum(p.numel() for p in MBInvBaseBiMamba(
+        IN_CHANNELS, NUM_CLASSES, args.d_model, args.n_layers,
+        args.d_state, args.dropout, args.attn_reduction).parameters())
+    bvp_params = (args.d_model + BVP_DIM) * 32 + 32 * NUM_CLASSES + 32 + NUM_CLASSES \
+                 if use_bvp else 0
+    print(f"Step 5 — Model: MBInvBaseBiMamba{'+ BVP head' if use_bvp else ''}")
+    print(f"  EEG params : {n_params_est:,}")
+    print(f"  BVP head   : {'~'+str(bvp_params) if use_bvp else 'N/A'}")
     print()
-
-    # ── 6. Datasets & Loaders ────────────────────────────────────────────────
-    train_ds = EmognitionMBDataset(tr_wins, tr_wlbls, augment=True)
-    val_ds   = EmognitionMBDataset(va_wins, va_wlbls, augment=False)
-    test_ds  = EmognitionMBDataset(te_wins, te_wlbls, augment=False)
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              shuffle=True, num_workers=0, pin_memory=True,
-                              drop_last=False)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
-                              shuffle=False, num_workers=0, pin_memory=True)
-    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size,
-                              shuffle=False, num_workers=0, pin_memory=True)
-
-    # ── 7. Model ─────────────────────────────────────────────────────────────
-    model = MBInvBaseBiMamba(
-        in_channels    = IN_CHANNELS,
-        num_classes    = NUM_CLASSES,
-        d_model        = args.d_model,
-        n_layers       = args.n_layers,
-        d_state        = args.d_state,
-        dropout        = args.dropout,
-        attn_reduction = args.attn_reduction,
-    ).to(device)
-
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Step 6 — Model: MBInvBaseBiMamba")
-    print(f"  Parameters   : {n_params:,}")
-    print(f"  Input shape  : (B, {IN_CHANNELS}, {window_size})")
-    print(f"  Mamba seq len: {window_size // 16}  (after conv stem ×16)\n")
 
     # ── 8. Optimiser & scheduler ──────────────────────────────────────────────
     criterion = LabelSmoothingCE(NUM_CLASSES, smoothing=args.label_smooth)
