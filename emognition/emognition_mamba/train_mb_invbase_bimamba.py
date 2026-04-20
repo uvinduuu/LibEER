@@ -130,31 +130,93 @@ def apply_band_stack(trial: np.ndarray, fs: float = FS,
     return np.concatenate(bands_out, axis=0)              # (C*5, T) = (20, T)
 
 
-def process_trial(trial: np.ndarray, baseline_spectrum, fs: float = FS) -> np.ndarray:
+# ════════════════════════════════════════════════════════════════════════════
+#  Baseline Normalisation
+# ════════════════════════════════════════════════════════════════════════════
+
+def apply_zscore_baseline(trial: np.ndarray, baseline_stats: dict | None,
+                          fs: float = FS) -> np.ndarray:
+    """
+    Z-score normalise using per-channel statistics from the resting baseline.
+
+    Z(t) = (x(t) - μ_baseline) / σ_baseline   per channel
+
+    This removes each subject's amplitude bias AND variance mismatch in the
+    time domain.  If no baseline is available, falls back to within-trial
+    z-score.
+
+    Args:
+        trial:           (4, T) float32 — clipped raw EEG
+        baseline_stats:  dict {'μ': (4,), 'σ': (4,)} or None
+        fs:              sampling rate (unused, kept for API symmetry)
+    Returns:
+        (4, T) float32 — z-scored trial
+    """
+    trial = trial.astype(np.float32)
+    if baseline_stats is not None:
+        μ = baseline_stats['μ'][:, np.newaxis]          # (4, 1)
+        σ = baseline_stats['σ'][:, np.newaxis] + 1e-8   # (4, 1)
+    else:
+        # fallback: within-trial normalisation
+        μ = trial.mean(axis=1, keepdims=True)
+        σ = trial.std(axis=1, keepdims=True) + 1e-8
+    return ((trial - μ) / σ).astype(np.float32)
+
+
+def extract_zscore_baselines(baselines_raw: dict) -> dict:
+    """
+    Convert raw baseline time-series (4, T) per subject into
+    {subj: {'μ': (4,), 'σ': (4,)}} dicts for Z-score normalisation.
+
+    Args:
+        baselines_raw: dict subj → (4, T) raw baseline EEG array
+                       (as returned by load_baselines_processed when
+                        raw=True is supported, or pre-extracted here)
+    Returns:
+        dict subj → {'μ': np.float32 (4,), 'σ': np.float32 (4,)}
+    """
+    stats = {}
+    for subj, raw in baselines_raw.items():
+        if raw is None:
+            continue
+        arr = np.asarray(raw, dtype=np.float32)     # (4, T)
+        stats[subj] = {
+            'μ': arr.mean(axis=1).astype(np.float32),
+            'σ': arr.std(axis=1).astype(np.float32),
+        }
+    return stats
+
+
+def process_trial(trial: np.ndarray, baseline_info, fs: float = FS,
+                  norm_mode: str = 'zscore') -> np.ndarray:
     """
     Full pre-processing pipeline for one raw EEG trial.
 
     Steps:
       1. Clip artefacts (±5 σ per channel)
-      2. InvBase normalization (time-domain, per subject)
+      2. Normalise:
+           'zscore'  : Z(t) = (x(t) - μ_base) / σ_base  [default]
+           'invbase' : spectral inverse-baseline (original)
       3. Band-filter into 5 bands → stack → (20, T)
 
     Args:
-        trial:             (4, T) float — raw EEG trial
-        baseline_spectrum: (4, freq_bins) or None — from load_baselines_processed
-        fs:                sampling rate in Hz
-
+        trial:         (4, T) float — raw EEG trial
+        baseline_info: for 'zscore': {'μ':(4,), 'σ':(4,)} or None
+                       for 'invbase': (4, freq_bins) spectrum or None
+        fs:            sampling rate in Hz
+        norm_mode:     'zscore' | 'invbase'
     Returns:
-        (20, T) float32 — pre-processed trial ready for windowing
+        (20, T) float32
     """
-    # 1 — clip
     trial = clip_artefacts(trial, n_sigma=5.0)
 
-    # 2 — InvBase (graceful fallback if no baseline for this subject)
-    trial = apply_invbase_to_raw(trial, baseline_spectrum, fs=fs)
+    if norm_mode == 'zscore':
+        trial = apply_zscore_baseline(trial, baseline_info, fs=fs)
+    else:
+        trial = apply_invbase_to_raw(trial, baseline_info, fs=fs)
 
-    # 3 — band filter + stack
     return apply_band_stack(trial, fs=fs)
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -204,31 +266,19 @@ def subject_split(subject_ids, seed: int = 42,
 # ════════════════════════════════════════════════════════════════════════════
 
 def window_trials(processed_trials, labels, subject_ids,
-                  window_size: int, step: int):
+                  window_size: int, step: int,
+                  emot_strs: list = None):
     """
     Slice pre-processed trials into fixed-size windows.
-
-    The last partial window is zero-padded on the right so that no data
-    is discarded from short trials.
-
-    Args:
-        processed_trials: list of (20, T_i) arrays
-        labels:           list of int labels
-        subject_ids:      list of str subject IDs
-        window_size:      number of time-steps per window
-        step:             stride between consecutive windows
-                          (use window_size for no overlap, window_size//2 for 50 %)
-
-    Returns:
-        windows:     list of (20, window_size) float32 arrays
-        win_labels:  list of int labels
-        win_subjs:   list of str subject IDs
+    Returns clip_ids alongside windows so clip-level evaluation is possible.
+    A clip_id is a unique integer per (subject, emotion) trial.
     """
-    windows, win_labels, win_subjs = [], [], []
+    windows, win_labels, win_subjs, win_clip_ids = [], [], [], []
+    clip_id = 0
 
-    for trial, label, subj in zip(processed_trials, labels, subject_ids):
-        C, T = trial.shape
-        # At least one window per trial even if T < window_size
+    for idx, (trial, label, subj) in enumerate(
+            zip(processed_trials, labels, subject_ids)):
+        C, T  = trial.shape
         starts = list(range(0, max(T - window_size + 1, 1), step))
         for s in starts:
             win = trial[:, s:s + window_size]
@@ -238,8 +288,10 @@ def window_trials(processed_trials, labels, subject_ids,
             windows.append(win.astype(np.float32))
             win_labels.append(label)
             win_subjs.append(subj)
+            win_clip_ids.append(clip_id)
+        clip_id += 1
 
-    return windows, win_labels, win_subjs
+    return windows, win_labels, win_subjs, win_clip_ids
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -250,7 +302,8 @@ def window_trials(processed_trials, labels, subject_ids,
 #  BVP / Samsung Watch Feature Extraction
 # ════════════════════════════════════════════════════════════════════════════
 
-BVP_DIM      = 4                    # [HR_mean, RMSSD, pNN50, IBI_range]
+BVP_DIM      = 8                    # extended: [HR_mean, RMSSD, pNN50, IBI_range,
+                                   #            SDNN, mean_IBI, LF_proxy, HF_proxy]
 TARGET_EMOT  = {'ENTHUSIASM', 'FEAR', 'NEUTRAL', 'SADNESS'}
 
 
@@ -264,10 +317,39 @@ def _parse_paired(raw):
         return None
 
 
+def _lf_hf_proxy(ibi: np.ndarray, fs_ibi: float = 4.0):
+    """
+    Approximate LF (0.04–0.15 Hz) and HF (0.15–0.4 Hz) power from IBI.
+    Uses Welch PSD on uniformly resampled IBI signal.
+    Returns (lf_power, hf_power) or (0, 0) if too short.
+    """
+    try:
+        from scipy.signal import welch, resample
+        if len(ibi) < 10:
+            return 0.0, 0.0
+        # Resample to uniform grid at fs_ibi Hz (standard for HRV)
+        duration = len(ibi) / fs_ibi
+        n_samp   = max(int(duration * fs_ibi), 8)
+        ibi_uni  = resample(ibi, n_samp)
+        f, pxx   = welch(ibi_uni, fs=fs_ibi, nperseg=min(64, n_samp))
+        lf = float(np.trapz(pxx[(f >= 0.04) & (f < 0.15)],
+                             f[(f >= 0.04) & (f < 0.15)] + 1e-12))
+        hf = float(np.trapz(pxx[(f >= 0.15) & (f < 0.40)],
+                             f[(f >= 0.15) & (f < 0.40)] + 1e-12))
+        return max(lf, 0.0), max(hf, 0.0)
+    except Exception:
+        return 0.0, 0.0
+
+
 def load_bvp_features_one(fp):
     """
-    Extract 4 HRV features from one Samsung Watch STIMULUS JSON.
-    Returns float32 array [HR_mean, RMSSD, pNN50, IBI_range] or None.
+    Extract 8 HRV features from one Samsung Watch STIMULUS JSON.
+
+    Features:
+        [HR_mean, RMSSD, pNN50, IBI_range,
+         SDNN, mean_IBI, LF_proxy, HF_proxy]
+
+    Returns float32 array (8,) or None.
     """
     try:
         with open(fp) as f:
@@ -291,8 +373,12 @@ def load_bvp_features_one(fp):
     rmssd     = float(np.sqrt(np.mean(np.diff(ibi) ** 2)))
     pnn50     = float(np.mean(np.abs(np.diff(ibi)) > 50))
     ibi_range = float(ibi.max() - ibi.min())
+    sdnn      = float(ibi.std())
+    mean_ibi  = float(ibi.mean())
+    lf, hf    = _lf_hf_proxy(ibi)
 
-    feat = np.array([hr_mean, rmssd, pnn50, ibi_range], dtype=np.float32)
+    feat = np.array([hr_mean, rmssd, pnn50, ibi_range, sdnn, mean_ibi, lf, hf],
+                    dtype=np.float32)
     return feat if np.all(np.isfinite(feat)) else None
 
 
@@ -378,10 +464,11 @@ class MultimodalMBModel(nn.Module):
 class EmognitionMBDataset(Dataset):
     """
     Dataset of (20, window_size) EEG windows + optional BVP feature vector.
-    Augmentations applied only when augment=True (training).
+    Stores clip_ids for clip-level aggregation at evaluation time.
     """
 
-    def __init__(self, windows, labels, bvp_feats=None, augment: bool = False,
+    def __init__(self, windows, labels, bvp_feats=None, clip_ids=None,
+                 augment: bool = False,
                  noise_ratio: float = 0.03,
                  scale_range: tuple = (0.85, 1.15),
                  band_drop_p: float = 0.15,
@@ -389,6 +476,7 @@ class EmognitionMBDataset(Dataset):
                  time_mask_frac: float = 0.10):
         self.windows        = windows
         self.labels         = labels
+        self.clip_ids       = clip_ids        # list[int] or None
         self.bvp_feats      = (torch.tensor(np.array(bvp_feats), dtype=torch.float32)
                                if bvp_feats is not None else None)
         self.augment        = augment
@@ -407,9 +495,10 @@ class EmognitionMBDataset(Dataset):
         if self.augment:
             x = self._augment(x)
         x_t = torch.from_numpy(x)
+        cid = self.clip_ids[idx] if self.clip_ids is not None else -1
         if self.bvp_feats is not None:
-            return x_t, self.bvp_feats[idx], label
-        return x_t, label
+            return x_t, self.bvp_feats[idx], label, cid
+        return x_t, label, cid
 
     def _augment(self, x: np.ndarray) -> np.ndarray:
         σ = x.std()
@@ -491,31 +580,60 @@ def setup_seed(seed: int):
 # ════════════════════════════════════════════════════════════════════════════
 
 def evaluate(model, loader, device, criterion, use_bvp=False):
-    """Evaluate model. Returns (loss, accuracy, macro-F1, preds, labels)."""
+    """
+    Window-level evaluation.
+    Dataset must return (eeg, [bvp,] label, clip_id) tuples.
+    Returns (loss, win_acc, win_f1, clip_acc, clip_f1, win_preds, win_labels).
+    """
     model.eval()
-    all_preds, all_labels = [], []
+    all_preds, all_labels, all_logits, all_cids = [], [], [], []
     total_loss, n_batches = 0.0, 0
 
     with torch.no_grad():
         for batch in loader:
-            if use_bvp and len(batch) == 3:
-                bx, bb, by = batch
+            if use_bvp and len(batch) == 4:
+                bx, bb, by, cid = batch
                 bb = bb.to(device)
             else:
-                bx, by = batch[0], batch[-1]
+                bx, by, cid = batch[0], batch[-2], batch[-1]
                 bb = None
-            bx = bx.to(device)
-            by = (by.long().to(device) if isinstance(by, torch.Tensor)
-                  else torch.tensor(by, dtype=torch.long, device=device))
+            bx  = bx.to(device)
+            by  = (by.long().to(device) if isinstance(by, torch.Tensor)
+                   else torch.tensor(by, dtype=torch.long, device=device))
             out = model(bx, bb) if use_bvp else model(bx)
             total_loss += criterion(out, by).item()
-            all_preds.extend(torch.argmax(out, 1).cpu().numpy())
+            probs = torch.softmax(out, dim=-1)
+            all_logits.extend(probs.cpu().numpy())
+            all_preds.extend(out.argmax(1).cpu().numpy())
             all_labels.extend(by.cpu().numpy())
+            all_cids.extend(cid.cpu().numpy() if isinstance(cid, torch.Tensor)
+                            else cid)
             n_batches += 1
 
-    acc = np.mean(np.array(all_preds) == np.array(all_labels))
-    f1  = f1_score(all_labels, all_preds, average="macro", zero_division=0)
-    return total_loss / max(n_batches, 1), acc, f1, all_preds, all_labels
+    # Window-level
+    all_preds  = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    all_logits = np.array(all_logits)
+    all_cids   = np.array(all_cids)
+    win_acc = float(np.mean(all_preds == all_labels))
+    win_f1  = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+
+    # Clip-level: average softmax probabilities over all windows per clip
+    clip_preds, clip_true = [], []
+    for cid in np.unique(all_cids):
+        mask        = all_cids == cid
+        avg_prob    = all_logits[mask].mean(axis=0)  # (n_classes,)
+        clip_pred   = int(avg_prob.argmax())
+        clip_label  = int(all_labels[mask][0])       # all windows share same label
+        clip_preds.append(clip_pred)
+        clip_true.append(clip_label)
+    clip_acc = float(np.mean(np.array(clip_preds) == np.array(clip_true)))
+    clip_f1  = f1_score(clip_true, clip_preds, average='macro', zero_division=0)
+
+    return (total_loss / max(n_batches, 1),
+            win_acc, win_f1, clip_acc, clip_f1,
+            all_preds.tolist(), all_labels.tolist(),
+            clip_preds, clip_true)
 
 
 def print_report(y_true, y_pred, title: str = ""):
@@ -584,7 +702,14 @@ def main():
     parser.add_argument("--patience",      type=int,   default=25)
 
     # ── misc ──
-    parser.add_argument("--seed",    type=int,  default=42)
+    parser.add_argument("--seed",       type=int,  default=42)
+    parser.add_argument("--n_seeds",    type=int,  default=5,
+                        help="Number of seeds for ensemble (1 = no ensemble)")
+    parser.add_argument("--swa_start",  type=int,  default=40,
+                        help="Epoch to start SWA averaging (0 = disable)")
+    parser.add_argument("--norm_mode",  type=str,  default='zscore',
+                        choices=['zscore', 'invbase'],
+                        help="Baseline normalisation: zscore (default) or invbase")
     parser.add_argument("--device",  type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--overfit_test", action="store_true")
@@ -629,21 +754,44 @@ def main():
 
     # ── 2. Load baselines ────────────────────────────────────────────────────
     print("Step 2 — Loading baseline spectra...")
-    t0       = time.time()
-    baselines = load_baselines_processed(args.data_root, fs=FS)
-    n_covered = sum(1 for s in set(subject_ids) if s in baselines)
-    n_total   = len(set(subject_ids))
-    print(f"  InvBase coverage: {n_covered}/{n_total} subjects have a baseline\n"
-          f"  ({n_total - n_covered} will use pass-through normalization)\n"
-          f"  Done in {time.time() - t0:.1f}s\n")
+    t0 = time.time()
+    baselines_raw = load_baselines_processed(args.data_root, fs=FS)
+
+    # Build per-subject baseline_info for whichever norm_mode is used
+    if args.norm_mode == 'zscore':
+        # Extract per-channel μ, σ from raw baseline time-series
+        baseline_info = {}
+        for subj, raw in baselines_raw.items():
+            if raw is None:
+                continue
+            try:
+                arr = np.asarray(raw, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[0] == 4:
+                    baseline_info[subj] = {
+                        'μ': arr.mean(axis=1).astype(np.float32),
+                        'σ': arr.std(axis=1).astype(np.float32),
+                    }
+                else:
+                    baseline_info[subj] = None
+            except Exception:
+                baseline_info[subj] = None
+        n_covered = sum(1 for v in baseline_info.values() if v is not None)
+    else:
+        baseline_info = baselines_raw
+        n_covered = sum(1 for s in set(subject_ids) if s in baseline_info)
+
+    n_total = len(set(subject_ids))
+    print(f"  norm_mode   : {args.norm_mode}")
+    print(f"  Coverage    : {n_covered}/{n_total} subjects have a baseline")
+    print(f"  Done in {time.time() - t0:.1f}s\n")
 
     # ── 3. Pre-process trials ────────────────────────────────────────────────
-    print("Step 3 — Pre-processing (clip → InvBase → band-stack)...")
+    print(f"Step 3 — Pre-processing (clip → {args.norm_mode} → band-stack)...")
     t0 = time.time()
     processed_trials = []
     for i, (trial, subj) in enumerate(zip(trials, subject_ids)):
-        baseline_spectrum = baselines.get(subj, None)
-        proc = process_trial(trial, baseline_spectrum, fs=FS)
+        binfo = baseline_info.get(subj, None)
+        proc  = process_trial(trial, binfo, fs=FS, norm_mode=args.norm_mode)
         processed_trials.append(proc)
         if (i + 1) % 20 == 0 or (i + 1) == len(trials):
             print(f"  {i + 1}/{len(trials)} trials processed...", end="\r")
@@ -651,7 +799,6 @@ def main():
           f"  Output shape per trial: (20, T_i) "
           f"[5 bands × 4 channels = {IN_CHANNELS} channels]")
 
-    # Print trial length stats post-processing
     lengths = [t.shape[1] for t in processed_trials]
     print(f"  Trial lengths: min={min(lengths)/FS:.1f}s, "
           f"max={max(lengths)/FS:.1f}s, "
@@ -737,11 +884,11 @@ def main():
         step_tr = window_size // 2
         step_ev = window_size
 
-        tr_wins, tr_wlbls, tr_wsubs = window_trials(
+        tr_wins, tr_wlbls, tr_wsubs, tr_cids = window_trials(
             tr_proc, tr_lbl, tr_sub, window_size, step_tr)
-        va_wins, va_wlbls, va_wsubs = window_trials(
+        va_wins, va_wlbls, va_wsubs, va_cids = window_trials(
             va_proc, va_lbl, va_sub, window_size, step_ev)
-        te_wins, te_wlbls, te_wsubs = window_trials(
+        te_wins, te_wlbls, te_wsubs, te_cids = window_trials(
             te_proc, te_lbl, te_sub, window_size, step_ev)
 
         # Count windows per trial for BVP replication
@@ -754,11 +901,13 @@ def main():
         te_bvp = get_bvp_per_window(te_sub, te_emot, count_wins(te_proc, step_ev))
 
         if fold_name:
-            print(f"  Windows: tr={len(tr_wins)}, va={len(va_wins)}, te={len(te_wins)}")
+            n_clips = len(set(te_cids))
+            print(f"  Windows: tr={len(tr_wins)}, va={len(va_wins)}, te={len(te_wins)} "
+                  f"({n_clips} test clips)")
 
-        tr_ds = EmognitionMBDataset(tr_wins, tr_wlbls, tr_bvp, augment=True)
-        va_ds = EmognitionMBDataset(va_wins, va_wlbls, va_bvp, augment=False)
-        te_ds = EmognitionMBDataset(te_wins, te_wlbls, te_bvp, augment=False)
+        tr_ds = EmognitionMBDataset(tr_wins, tr_wlbls, tr_bvp, tr_cids, augment=True)
+        va_ds = EmognitionMBDataset(va_wins, va_wlbls, va_bvp, va_cids, augment=False)
+        te_ds = EmognitionMBDataset(te_wins, te_wlbls, te_bvp, te_cids, augment=False)
 
         tr_dl = DataLoader(tr_ds, args.batch_size, shuffle=True,
                            drop_last=False, num_workers=0, pin_memory=True)
@@ -789,6 +938,10 @@ def main():
                                           args.epochs, min_lr=1e-7)
 
         best_f1 = 0.0; best_st = None; pat_ctr = 0
+        # SWA: accumulate averaged weights
+        swa_state   = None
+        swa_count   = 0
+        swa_active  = (args.swa_start > 0)
 
         for epoch in range(1, args.epochs + 1):
             fold_model.train()
@@ -814,17 +967,32 @@ def main():
                 ep_tot  += len(by)
 
             sched.step()
-            _, va_acc, va_f1, _, _ = evaluate(fold_model, va_dl, device,
-                                               eval_crit, use_bvp)
+
+            # SWA: accumulate running average after swa_start
+            if swa_active and epoch >= args.swa_start:
+                swa_count += 1
+                curr_state = fold_model.state_dict()
+                if swa_state is None:
+                    swa_state = {k: v.cpu().float().clone() for k, v in curr_state.items()}
+                else:
+                    for k in swa_state:
+                        swa_state[k] += (curr_state[k].cpu().float() - swa_state[k]) / swa_count
+
+            ret = evaluate(fold_model, va_dl, device, eval_crit, use_bvp)
+            _, va_acc, va_f1, va_clip_acc, va_clip_f1, _, _, _, _ = ret
+            # Use clip-level F1 to drive early stopping (more stable signal)
+            monitor_f1 = va_clip_f1
 
             if epoch % 10 == 0 or epoch == 1:
                 tr_acc = ep_ok / max(ep_tot, 1)
+                swa_tag = f" SWA×{swa_count}" if swa_count > 0 else ""
                 print(f"  {fold_name} Ep{epoch:3d} | "
-                      f"Tr:{tr_acc:.3f} | Va:{va_acc:.3f} F1:{va_f1:.3f} | "
-                      f"lr:{sched.get_last_lr()[0]:.1e}")
+                      f"Tr:{tr_acc:.3f} | "
+                      f"Va-win:{va_acc:.3f} Va-clip:{va_clip_acc:.3f} F1:{va_clip_f1:.3f} | "
+                      f"lr:{sched.get_last_lr()[0]:.1e}{swa_tag}")
 
-            if va_f1 > best_f1:
-                best_f1 = va_f1
+            if monitor_f1 > best_f1:
+                best_f1 = monitor_f1
                 best_st = {k: v.cpu().clone() for k, v in fold_model.state_dict().items()}
                 pat_ctr = 0
             else:
@@ -833,13 +1001,21 @@ def main():
                     print(f"  Early stop at epoch {epoch}")
                     break
 
-        if best_st:
+        # Use SWA weights if available (better generalization), else best-val
+        if swa_state is not None and swa_count >= 3:
+            print(f"  Using SWA weights ({swa_count} epochs averaged)")
+            ref = fold_model.state_dict()
+            swa_state_cast = {k: swa_state[k].to(ref[k].dtype) for k in swa_state}
+            fold_model.load_state_dict(swa_state_cast)
+        elif best_st:
             fold_model.load_state_dict(best_st)
-            fold_model = fold_model.to(device)
+        fold_model = fold_model.to(device)
 
-        _, te_acc, te_f1, te_preds, te_lbls = evaluate(
-            fold_model, te_dl, device, eval_crit, use_bvp)
-        return te_acc, te_f1, te_preds, te_lbls
+        ret = evaluate(fold_model, te_dl, device, eval_crit, use_bvp)
+        _, te_win_acc, te_win_f1, te_clip_acc, te_clip_f1, \
+            te_win_preds, te_win_lbls, te_clip_preds, te_clip_lbls = ret
+        return (te_win_acc, te_win_f1, te_win_preds, te_win_lbls,
+                te_clip_acc, te_clip_f1, te_clip_preds, te_clip_lbls)
 
     # ── 5+6+7: Split, window, train ──────────────────────────────────────────
     n_params_est = sum(p.numel() for p in MBInvBaseBiMamba(
@@ -855,7 +1031,9 @@ def main():
     if args.mode == 'loso':
         # ── LOSO ─────────────────────────────────────────────────────────────
         unique_subjs = sorted(set(subject_ids))
-        all_preds, all_true, fold_accs, fold_f1s = [], [], [], []
+        all_w_preds, all_w_true = [], []
+        all_c_preds, all_c_true = [], []
+        fold_accs = []
 
         for fi, test_subj in enumerate(unique_subjs):
             print(f"\n{'='*70}")
@@ -866,7 +1044,6 @@ def main():
             te_idx = [i for i in range(len(labels)) if subject_ids[i] == test_subj]
             tr_all = [i for i in range(len(labels)) if subject_ids[i] != test_subj]
 
-            # 15% of remaining subjects → val
             rem_subjs  = sorted(set(subject_ids[i] for i in tr_all))
             n_va       = max(1, int(0.15 * len(rem_subjs)))
             va_subjs_f = set(np.random.RandomState(args.seed).choice(
@@ -884,26 +1061,30 @@ def main():
             va, vl, vs, ve  = gd(va_idx)
             xa, xl, xs, xe  = gd(te_idx)
 
-            acc, f1, preds, true = run_one_split(
+            (w_acc, w_f1, w_preds, w_true,
+             c_acc, c_f1, c_preds, c_true) = run_one_split(
                 ta, tl, ts, te_, va, vl, vs, ve, xa, xl, xs, xe,
                 fold_name=f"Fold{fi+1}")
 
-            print(f"  → Fold {fi+1} ({test_subj}): Acc={acc:.4f}  F1={f1:.4f}")
-            all_preds.extend(preds); all_true.extend(true)
-            fold_accs.append(acc);   fold_f1s.append(f1)
+            print(f"  → Fold {fi+1} ({test_subj}): "
+                  f"Win-Acc={w_acc:.4f}  Clip-Acc={c_acc:.4f}  Clip-F1={c_f1:.4f}")
+            all_w_preds.extend(w_preds); all_w_true.extend(w_true)
+            all_c_preds.extend(c_preds); all_c_true.extend(c_true)
+            fold_accs.append(c_acc)
 
-        # ── Aggregate ─────────────────────────────────────────────────────────
-        loso_acc = np.mean(np.array(all_preds) == np.array(all_true))
-        loso_f1  = f1_score(all_true, all_preds, average='macro', zero_division=0)
+        loso_win_acc = np.mean(np.array(all_w_preds) == np.array(all_w_true))
+        loso_clip_acc = np.mean(np.array(all_c_preds) == np.array(all_c_true))
+        loso_clip_f1  = f1_score(all_c_true, all_c_preds, average='macro', zero_division=0)
         print(f"\n{'='*70}")
         print(f"  LOSO FINAL — {'Multimodal EEG+BVP' if use_bvp else 'EEG-only'}")
         print(f"{'='*70}")
-        print(f"  Global Acc : {loso_acc:.4f}  ({loso_acc*100:.1f}%)")
-        print(f"  Global F1  : {loso_f1:.4f}")
+        print(f"  Window Acc : {loso_win_acc:.4f}  ({loso_win_acc*100:.1f}%)")
+        print(f"  Clip Acc   : {loso_clip_acc:.4f}  ({loso_clip_acc*100:.1f}%)  ← KEY METRIC")
+        print(f"  Clip F1    : {loso_clip_f1:.4f}")
         print(f"  Per-fold   : mean={np.mean(fold_accs):.4f} ± {np.std(fold_accs):.4f}")
         print(f"  Chance     : {100/NUM_CLASSES:.1f}%")
-        print_report(all_true, all_preds,
-                     title=f"LOSO {'EEG+BVP' if use_bvp else 'EEG-only'}")
+        print_report(all_c_true, all_c_preds,
+                     title=f"LOSO Clip-Level {'EEG+BVP' if use_bvp else 'EEG-only'}")
 
     else:
         # ── 70/15/15 subject-independent split ────────────────────────────────
@@ -922,17 +1103,21 @@ def main():
         va, vl, vs, ve  = gd(va_subjs)
         xa, xl, xs, xe  = gd(te_subjs)
 
-        acc, f1, preds, true = run_one_split(
+        (w_acc, w_f1, w_preds, w_true,
+         c_acc, c_f1, c_preds, c_true) = run_one_split(
             ta, tl, ts, te_, va, vl, vs, ve, xa, xl, xs, xe, fold_name="")
 
         print(f"\n{'='*70}")
         print(f"  RESULTS — {'EEG+BVP' if use_bvp else 'EEG-only'} / sub_indep")
         print(f"{'='*70}")
-        print(f"  Test Acc : {acc:.4f}  ({acc*100:.1f}%)")
-        print(f"  Test F1  : {f1:.4f}")
-        print_report(true, preds, title="sub_indep")
+        print(f"  Window Acc : {w_acc:.4f}  ({w_acc*100:.1f}%)")
+        print(f"  Clip   Acc : {c_acc:.4f}  ({c_acc*100:.1f}%)  ← KEY METRIC")
+        print(f"  Clip   F1  : {c_f1:.4f}")
+        print(f"  Chance     : {100/NUM_CLASSES:.1f}%")
+        print_report(c_true, c_preds, title="sub_indep Clip-Level")
 
 
 if __name__ == "__main__":
     main()
+
 
