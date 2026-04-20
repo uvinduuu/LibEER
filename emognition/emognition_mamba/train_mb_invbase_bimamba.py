@@ -852,113 +852,87 @@ def main():
     print(f"  BVP head   : {'~'+str(bvp_params) if use_bvp else 'N/A'}")
     print()
 
-    # ── 8. Optimiser & scheduler ──────────────────────────────────────────────
-    criterion = LabelSmoothingCE(NUM_CLASSES, smoothing=args.label_smooth)
-    eval_crit = nn.CrossEntropyLoss()   # unsmoothed, for true val/test loss
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr,
-                            weight_decay=args.weight_decay, eps=1e-8)
-    scheduler = WarmupCosineScheduler(optimizer,
-                                      warmup_epochs=args.warmup_epochs,
-                                      total_epochs=args.epochs,
-                                      min_lr=1e-7)
+    if args.mode == 'loso':
+        # ── LOSO ─────────────────────────────────────────────────────────────
+        unique_subjs = sorted(set(subject_ids))
+        all_preds, all_true, fold_accs, fold_f1s = [], [], [], []
 
-    # ── 9. Training loop ──────────────────────────────────────────────────────
-    best_val_f1   = 0.0
-    best_state    = None
-    patience_ctr  = 0
-    epoch_times   = []
+        for fi, test_subj in enumerate(unique_subjs):
+            print(f"\n{'='*70}")
+            print(f"  FOLD {fi+1}/{len(unique_subjs)}  —  Test subject: {test_subj}")
+            print(f"{'='*70}")
+            setup_seed(args.seed + fi)
 
-    print(f"Step 7 — Training ({args.epochs} epochs, "
-          f"patience={args.patience if args.patience > 0 else 'off'})\n"
-          f"{'='*70}")
+            te_idx = [i for i in range(len(labels)) if subject_ids[i] == test_subj]
+            tr_all = [i for i in range(len(labels)) if subject_ids[i] != test_subj]
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        ep_loss, ep_correct, ep_total = 0.0, 0, 0
-        t_ep = time.time()
+            # 15% of remaining subjects → val
+            rem_subjs  = sorted(set(subject_ids[i] for i in tr_all))
+            n_va       = max(1, int(0.15 * len(rem_subjs)))
+            va_subjs_f = set(np.random.RandomState(args.seed).choice(
+                             rem_subjs, n_va, replace=False))
+            tr_idx = [i for i in tr_all if subject_ids[i] not in va_subjs_f]
+            va_idx = [i for i in tr_all if subject_ids[i] in va_subjs_f]
 
-        for bx, by in train_loader:
-            bx  = bx.to(device)
-            by  = (by.long().to(device) if isinstance(by, torch.Tensor)
-                   else torch.tensor(by, dtype=torch.long, device=device))
-            optimizer.zero_grad()
-            out  = model(bx)
-            loss = criterion(out, by)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            ep_loss    += loss.item()
-            ep_correct += (torch.argmax(out, 1) == by).sum().item()
-            ep_total   += len(by)
+            def gd(idx):
+                return ([processed_trials[i] for i in idx],
+                        [labels[i]            for i in idx],
+                        [subject_ids[i]       for i in idx],
+                        [emot_strs[i]         for i in idx])
 
-        scheduler.step()
-        tr_acc  = ep_correct / max(ep_total, 1)
-        tr_loss = ep_loss    / max(len(train_loader), 1)
+            ta, tl, ts, te_ = gd(tr_idx)
+            va, vl, vs, ve  = gd(va_idx)
+            xa, xl, xs, xe  = gd(te_idx)
 
-        va_loss, va_acc, va_f1, _, _ = evaluate(model, val_loader, device,
-                                                  eval_crit)
-        ep_time = time.time() - t_ep
-        epoch_times.append(ep_time)
+            acc, f1, preds, true = run_one_split(
+                ta, tl, ts, te_, va, vl, vs, ve, xa, xl, xs, xe,
+                fold_name=f"Fold{fi+1}")
 
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"  Epoch {epoch:4d}/{args.epochs} | "
-                  f"Tr loss {tr_loss:.4f}  acc {tr_acc:.4f} | "
-                  f"Va loss {va_loss:.4f}  acc {va_acc:.4f}  F1 {va_f1:.4f} | "
-                  f"{ep_time:.1f}s | lr {scheduler.get_last_lr()[0]:.2e}")
+            print(f"  → Fold {fi+1} ({test_subj}): Acc={acc:.4f}  F1={f1:.4f}")
+            all_preds.extend(preds); all_true.extend(true)
+            fold_accs.append(acc);   fold_f1s.append(f1)
 
-        if va_f1 > best_val_f1:
-            best_val_f1 = va_f1
-            best_state  = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_ctr = 0
-        else:
-            patience_ctr += 1
+        # ── Aggregate ─────────────────────────────────────────────────────────
+        loso_acc = np.mean(np.array(all_preds) == np.array(all_true))
+        loso_f1  = f1_score(all_true, all_preds, average='macro', zero_division=0)
+        print(f"\n{'='*70}")
+        print(f"  LOSO FINAL — {'Multimodal EEG+BVP' if use_bvp else 'EEG-only'}")
+        print(f"{'='*70}")
+        print(f"  Global Acc : {loso_acc:.4f}  ({loso_acc*100:.1f}%)")
+        print(f"  Global F1  : {loso_f1:.4f}")
+        print(f"  Per-fold   : mean={np.mean(fold_accs):.4f} ± {np.std(fold_accs):.4f}")
+        print(f"  Chance     : {100/NUM_CLASSES:.1f}%")
+        print_report(all_true, all_preds,
+                     title=f"LOSO {'EEG+BVP' if use_bvp else 'EEG-only'}")
 
-        if args.patience > 0 and patience_ctr >= args.patience:
-            print(f"\n  Early stopping at epoch {epoch} "
-                  f"(patience={args.patience})")
-            break
+    else:
+        # ── 70/15/15 subject-independent split ────────────────────────────────
+        print("Step — Subject-independent split (70/15/15)...")
+        tr_subjs, va_subjs, te_subjs = subject_split(
+            subject_ids, seed=args.seed,
+            val_frac=args.val_size, test_frac=args.test_size)
+        print(f"  Train:{len(tr_subjs)}  Val:{len(va_subjs)}  Test:{len(te_subjs)}\n")
 
-    # ── 10. Test evaluation ───────────────────────────────────────────────────
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    model = model.to(device)
+        def gd(subj_set):
+            idx = [i for i, s in enumerate(subject_ids) if s in subj_set]
+            return ([processed_trials[i] for i in idx], [labels[i] for i in idx],
+                    [subject_ids[i] for i in idx],      [emot_strs[i] for i in idx])
 
-    te_loss, te_acc, te_f1, te_preds, te_labels = evaluate(
-        model, test_loader, device, eval_crit
-    )
+        ta, tl, ts, te_ = gd(tr_subjs)
+        va, vl, vs, ve  = gd(va_subjs)
+        xa, xl, xs, xe  = gd(te_subjs)
 
-    print(f"\n{'='*70}")
-    print(f"  RESULTS  —  MB-InvBase-BiMamba  /  Emognition")
-    print(f"{'='*70}")
-    print(f"  Best Val F1  : {best_val_f1:.4f}")
-    print(f"  Test Acc     : {te_acc:.4f}")
-    print(f"  Test Macro-F1: {te_f1:.4f}")
-    print(f"  Avg epoch    : {np.mean(epoch_times):.1f}s")
-    print(f"  Total time   : {sum(epoch_times)/60:.1f} min")
-    print_report(te_labels, te_preds, title="Emognition Test Set")
+        acc, f1, preds, true = run_one_split(
+            ta, tl, ts, te_, va, vl, vs, ve, xa, xl, xs, xe, fold_name="")
 
-    # ── 11. Save checkpoint ───────────────────────────────────────────────────
-    ckpt_path = os.path.join(save_dir, "best_model.pt")
-    torch.save({
-        "model_state": model.state_dict(),
-        "model_cfg": {
-            "in_channels":    IN_CHANNELS,
-            "num_classes":    NUM_CLASSES,
-            "d_model":        args.d_model,
-            "n_layers":       args.n_layers,
-            "d_state":        args.d_state,
-            "dropout":        args.dropout,
-            "attn_reduction": args.attn_reduction,
-        },
-        "id2lab":   id2lab,
-        "lab2id":   lab2id,
-        "val_f1":   best_val_f1,
-        "test_acc": te_acc,
-        "test_f1":  te_f1,
-        "args":     vars(args),
-    }, ckpt_path)
-    print(f"\n  Checkpoint saved → {ckpt_path}\n")
+        print(f"\n{'='*70}")
+        print(f"  RESULTS — {'EEG+BVP' if use_bvp else 'EEG-only'} / sub_indep")
+        print(f"{'='*70}")
+        print(f"  Test Acc : {acc:.4f}  ({acc*100:.1f}%)")
+        print(f"  Test F1  : {f1:.4f}")
+        print_report(true, preds, title="sub_indep")
 
 
 if __name__ == "__main__":
     main()
+
