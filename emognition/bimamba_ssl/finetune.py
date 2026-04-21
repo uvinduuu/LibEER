@@ -102,9 +102,8 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device,
     return total_loss / max(len(loader), 1), n_correct / max(n_total, 1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Main
-# ══════════════════════════════════════════════════════════════════════════════
+# The 4 target emotions — must match train_mb_invbase_bimamba.py's TARGET_EMOT
+_TARGET_EMOTIONS = ['ENTHUSIASM', 'FEAR', 'NEUTRAL', 'SADNESS']
 
 def main():
     parser = argparse.ArgumentParser(
@@ -191,8 +190,11 @@ def main():
     # ── Step 1: Load trials ──────────────────────────────────────────────────
     print('\nStep 1 — Loading trials...')
     t0 = time.time()
-    trials, labels, subject_ids, emot_strs = load_emognition_processed(
-        args.data_root)
+    trials, labels, subject_ids, lab2id, id2lab = load_emognition_processed(
+        args.data_root,
+        emotions=_TARGET_EMOTIONS,   # filter to 4 target emotions only
+        verbose=True)
+    emot_strs = [id2lab[l] for l in labels]   # emotion string per trial
     print(f'  Done in {time.time()-t0:.1f}s  ({len(trials)} trials)\n')
 
     # ── Step 2: Baselines ────────────────────────────────────────────────────
