@@ -67,6 +67,22 @@ FS           = 256           # Muse 2 sampling rate (Hz)
 NUM_CLASSES  = 4
 CLASS_NAMES  = ["ENTHUSIASM", "FEAR", "NEUTRAL", "SADNESS"]  # alphabetical
 
+# L-R electrode symmetry flip index for the stacked (20, T) band representation.
+# MUSE 2 electrode order per band: [TP9(L), AF7(L), AF8(R), TP10(R)]
+# Swapping left ↔ right hemispheres: [TP10, AF8, AF7, TP9] = indices [3,2,1,0] per band.
+# This is a valid label-preserving augmentation because:
+#   (a) emotions activate bilateral brain networks,
+#   (b) headband fit varies slightly left/right across subjects,
+#   (c) inflates effective training set size by ~2× for free.
+# Pattern: reverse within each 4-channel block across all 5 bands.
+_LR_FLIP_IDX = np.array([
+    3, 2, 1, 0,          # band 0 (delta):  TP10, AF8, AF7, TP9
+    7, 6, 5, 4,          # band 1 (theta)
+    11, 10, 9, 8,        # band 2 (alpha)
+    15, 14, 13, 12,      # band 3 (beta)
+    19, 18, 17, 16,      # band 4 (gamma)
+], dtype=np.intp)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Signal Pre-processing Utilities
@@ -608,8 +624,9 @@ class EmognitionMBDataset(Dataset):
 
     def __init__(self, windows, labels, bvp_feats=None, clip_ids=None,
                  augment: bool = False,
-                 noise_ratio: float = 0.03,
+                 noise_ratio: float = 0.05,         # bumped from 0.03 → 0.05
                  scale_range: tuple = (0.85, 1.15),
+                 flip_lr_p: float = 0.50,           # NEW: L-R electrode flip
                  band_drop_p: float = 0.15,
                  time_mask_p: float = 0.40,
                  time_mask_frac: float = 0.10):
@@ -621,6 +638,7 @@ class EmognitionMBDataset(Dataset):
         self.augment        = augment
         self.noise_ratio    = noise_ratio
         self.scale_range    = scale_range
+        self.flip_lr_p      = flip_lr_p
         self.band_drop_p    = band_drop_p
         self.time_mask_p    = time_mask_p
         self.time_mask_frac = time_mask_frac
@@ -640,18 +658,33 @@ class EmognitionMBDataset(Dataset):
         return x_t, label, cid
 
     def _augment(self, x: np.ndarray) -> np.ndarray:
+        # ① Gaussian noise  (5% of signal std)
         σ = x.std()
         if σ > 1e-8:
             x = x + np.random.randn(*x.shape).astype(np.float32) * σ * self.noise_ratio
+
+        # ② Amplitude scaling  (±15%)
         x = x * np.random.uniform(*self.scale_range)
+
+        # ③ L-R electrode symmetry flip
+        # Swaps [TP9(L), AF7(L), AF8(R), TP10(R)] → [TP10(R), AF8(R), AF7(L), TP9(L)]
+        # per band — valid because emotion activates bilateral networks and
+        # headband fit varies L/R across subjects.
+        if np.random.random() < self.flip_lr_p:
+            x = x[_LR_FLIP_IDX]
+
+        # ④ Band dropout  (zero one entire frequency band)
         if np.random.random() < self.band_drop_p:
             b = np.random.randint(0, NUM_BANDS)
             x[b*4:(b+1)*4, :] = 0.0
+
+        # ⑤ Time masking  (mask 10% of temporal window)
         if np.random.random() < self.time_mask_p:
             T   = x.shape[1]
             ml  = max(1, int(T * self.time_mask_frac))
             s   = np.random.randint(0, max(T - ml, 1) + 1)
             x[:, s:s+ml] = 0.0
+
         return x
 
 
