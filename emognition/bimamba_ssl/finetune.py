@@ -178,7 +178,7 @@ def main():
         print(f'  freeze_enc  : {args.freeze_encoder}')
         enc_lr_str = "frozen" if args.freeze_encoder else str(args.encoder_lr)
         print(f'  LR (enc/head): {enc_lr_str} / {args.lr}')
-    print(f'  BVP fusion  : {"✅ ON" if use_bvp else "❌ OFF (EEG-only)"}')
+    print(f'  BVP fusion  : {"ON" if use_bvp else "OFF (EEG-only)"}')
     print(f'  window      : {args.window_sec}s → {window_size} samples')
     print(f'  model       : d_model={args.d_model}, n_layers={args.n_layers}, '
           f'dropout={args.dropout}')
@@ -290,9 +290,9 @@ def main():
             print(f'  [warn] missing keys   : {missing}')
         if unexpected:
             print(f'  [warn] unexpected keys: {unexpected}')
-        print(f'  ✅ Pre-trained encoder loaded')
+        print(f'Pre-trained encoder loaded')
     else:
-        print(f'  ⚠️  Random init (ablation — no --pretrained given)')
+        print(f'Random init (ablation — no --pretrained given)')
 
     if use_bvp:
         model = MultimodalMBModel(backbone, bvp_dim=BVP_DIM,
