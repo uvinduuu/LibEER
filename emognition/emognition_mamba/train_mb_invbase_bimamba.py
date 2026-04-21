@@ -707,9 +707,9 @@ def main():
                         help="Number of seeds for ensemble (1 = no ensemble)")
     parser.add_argument("--swa_start",  type=int,  default=40,
                         help="Epoch to start SWA averaging (0 = disable)")
-    parser.add_argument("--norm_mode",  type=str,  default='zscore',
+    parser.add_argument("--norm_mode",  type=str,  default='invbase',
                         choices=['zscore', 'invbase'],
-                        help="Baseline normalisation: zscore (default) or invbase")
+                        help="Baseline normalisation: invbase (default) or zscore")
     parser.add_argument("--device",  type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--overfit_test", action="store_true")
@@ -980,8 +980,8 @@ def main():
 
             ret = evaluate(fold_model, va_dl, device, eval_crit, use_bvp)
             _, va_acc, va_f1, va_clip_acc, va_clip_f1, _, _, _, _ = ret
-            # Use clip-level F1 to drive early stopping (more stable signal)
-            monitor_f1 = va_clip_f1
+            # Use window-level F1 for early stopping (more stable: 700+ windows vs ~24 clips)
+            monitor_f1 = va_f1
 
             if epoch % 10 == 0 or epoch == 1:
                 tr_acc = ep_ok / max(ep_tot, 1)
