@@ -218,10 +218,125 @@ def process_trial(trial: np.ndarray, baseline_info, fs: float = FS,
     return apply_band_stack(trial, fs=fs)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Z-score Baseline Loader  (loads raw EEG  —  NOT spectral data)
+# ════════════════════════════════════════════════════════════════════════════
+
+_EEG_COLS = ["RAW_TP9", "RAW_AF7", "RAW_AF8", "RAW_TP10"]
+
+
+def load_baselines_raw(data_root: str) -> dict:
+    """
+    Load raw EEG time-series from BASELINE_MUSE_cleaned.json files and compute
+    per-channel (mu, sigma) for z-score normalisation.
+
+    This is the CORRECT approach for z-score -- it uses the actual EEG time-domain
+    signal, NOT the spectral data used by InvBase.
+
+    Returns:
+        dict: subj_str -> {'mu': float32(4,), 'sigma': float32(4,)}
+              or {} if no baseline files found.
+    """
+    import json as _json, glob as _glob, pandas as _pd
+    stats = {}
+    for subj_dir in sorted(glob.glob(os.path.join(data_root, '*'))):
+        if not os.path.isdir(subj_dir):
+            continue
+        sid = os.path.basename(subj_dir)
+        if not sid.isdigit():
+            continue
+        # find BASELINE_MUSE_cleaned.json
+        cands = sorted(glob.glob(os.path.join(subj_dir, '*_BASELINE_MUSE_cleaned.json')))
+        if not cands:
+            continue
+        fp = cands[0]
+        try:
+            with open(fp) as fh:
+                raw = _json.load(fh)
+            if isinstance(raw, dict) and 'data' in raw:
+                df = _pd.DataFrame(raw['data'])
+            elif isinstance(raw, list):
+                df = _pd.DataFrame(raw)
+            else:
+                df = _pd.DataFrame(raw)
+            cols = [c for c in _EEG_COLS if c in df.columns]
+            if len(cols) == 0:
+                continue
+            sig = np.stack([df[c].to_numpy(dtype=np.float64) for c in cols], axis=0)  # (4, T)
+            sig = np.nan_to_num(sig, nan=0.0, posinf=0.0, neginf=0.0)
+            mu  = sig.mean(axis=1).astype(np.float32)
+            sd  = sig.std(axis=1).astype(np.float32)
+            sd  = np.where(sd < 1e-6, 1.0, sd)   # clamp flat channels
+            stats[sid] = {'μ': mu, 'σ': sd}
+        except Exception as e:
+            print(f"  [load_baselines_raw] {sid}: {e}")
+    print(f"[load_baselines_raw] Loaded raw baseline for {len(stats)} subjects")
+    return stats
+
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Subject-Independent Split
+#  Euclidean Alignment  (He & Wu 2019)  -- per-subject EEG domain adaptation
 # ════════════════════════════════════════════════════════════════════════════
+
+def _reg_cov(X: np.ndarray, reg: float = 1e-4) -> np.ndarray:
+    """Regularised covariance of (C, T) array."""
+    C, T = X.shape
+    Xc   = X - X.mean(axis=1, keepdims=True)
+    cov  = (Xc @ Xc.T) / max(T - 1, 1)
+    cov  = (1 - reg) * cov + reg * (np.trace(cov) / C) * np.eye(C)
+    return cov
+
+
+def _sqrt_inv(M: np.ndarray) -> np.ndarray:
+    """Symmetric matrix square-root inverse via eigendecomposition."""
+    v, U = np.linalg.eigh(M)
+    return U @ np.diag(1.0 / np.sqrt(np.maximum(v, 1e-10))) @ U.T
+
+
+def euclidean_align_subjects(trials: list, subject_ids: list) -> list:
+    """
+    Euclidean Alignment (EA) per subject.
+
+    For each subject s, compute the arithmetic mean covariance R_s across all
+    their raw EEG trials, then apply:  x_aligned = R_s^{-1/2} @ x_raw
+
+    This re-centres every subject's EEG covariance to the identity matrix on
+    the SPD manifold, dramatically reducing inter-subject variability before
+    band-filtering.  Fully unsupervised -- requires no labels.
+
+    Reference:
+        He & Wu, "Transfer Learning for Brain-Computer Interfaces:
+        A Euclidean Space Data Alignment Approach", IEEE TNSRE 2019.
+
+    Args:
+        trials:      list of (4, T_i) float32 raw EEG arrays
+        subject_ids: list of str, same length as trials
+    Returns:
+        list of (4, T_i) float32 EA-aligned EEG arrays (same order)
+    """
+    from collections import defaultdict as _dd
+    subj_idx = _dd(list)
+    for i, sid in enumerate(subject_ids):
+        subj_idx[sid].append(i)
+
+    aligned = list(trials)             # shallow copy, entries replaced below
+    n_aligned = 0
+    for sid, idxs in subj_idx.items():
+        if len(idxs) < 2:              # single trial -- EA undefined, skip
+            continue
+        trs  = [trials[i].astype(np.float64) for i in idxs]
+        covs = [_reg_cov(t) for t in trs]
+        R    = np.stack(covs, axis=0).mean(axis=0)
+        Rinv = _sqrt_inv(R)
+        for i, t in zip(idxs, trs):
+            aligned[i] = (Rinv @ t).astype(np.float32)
+        n_aligned += len(idxs)
+    print(f"  [EA] Aligned {n_aligned}/{len(trials)} trials across "
+          f"{len(subj_idx)} subjects")
+    return aligned
+
+
+
 
 def subject_split(subject_ids, seed: int = 42,
                   val_frac: float = 0.15, test_frac: float = 0.15):
@@ -302,8 +417,10 @@ def window_trials(processed_trials, labels, subject_ids,
 #  BVP / Samsung Watch Feature Extraction
 # ════════════════════════════════════════════════════════════════════════════
 
-BVP_DIM      = 8                    # extended: [HR_mean, RMSSD, pNN50, IBI_range,
-                                   #            SDNN, mean_IBI, LF_proxy, HF_proxy]
+BVP_DIM      = 14                   # [HR_mean, RMSSD, pNN50, IBI_range,
+                                    #  SDNN, mean_IBI, LF, HF,
+                                    #  LF_HF_ratio, SD1, SD2, SD1_SD2_ratio,
+                                    #  NN50, CV]
 TARGET_EMOT  = {'ENTHUSIASM', 'FEAR', 'NEUTRAL', 'SADNESS'}
 
 
@@ -343,13 +460,13 @@ def _lf_hf_proxy(ibi: np.ndarray, fs_ibi: float = 4.0):
 
 def load_bvp_features_one(fp):
     """
-    Extract 8 HRV features from one Samsung Watch STIMULUS JSON.
+    Extract 14 HRV features from one Samsung Watch STIMULUS JSON.
 
     Features:
-        [HR_mean, RMSSD, pNN50, IBI_range,
-         SDNN, mean_IBI, LF_proxy, HF_proxy]
+        [HR_mean, RMSSD, pNN50, IBI_range, SDNN, mean_IBI,
+         LF, HF, LF_HF_ratio, SD1, SD2, SD1_SD2_ratio, NN50, CV]
 
-    Returns float32 array (8,) or None.
+    Returns float32 array (14,) or None.
     """
     try:
         with open(fp) as f:
@@ -368,17 +485,35 @@ def load_bvp_features_one(fp):
     if ibi is None or len(ibi) < 5:
         return None
 
+    # ── Basic IBI stats ──────────────────────────────────────────────────────
+    diff_ibi  = np.diff(ibi)
     hr_mean   = float(np.mean(hr))   if (hr is not None and len(hr) >= 3) \
                 else float(np.mean(60000.0 / ibi))
-    rmssd     = float(np.sqrt(np.mean(np.diff(ibi) ** 2)))
-    pnn50     = float(np.mean(np.abs(np.diff(ibi)) > 50))
+    rmssd     = float(np.sqrt(np.mean(diff_ibi ** 2)))
+    nn50      = float(np.sum(np.abs(diff_ibi) > 50))
+    pnn50     = float(np.mean(np.abs(diff_ibi) > 50))
     ibi_range = float(ibi.max() - ibi.min())
     sdnn      = float(ibi.std())
     mean_ibi  = float(ibi.mean())
-    lf, hf    = _lf_hf_proxy(ibi)
+    cv        = sdnn / (mean_ibi + 1e-8)              # Coefficient of Variation
 
-    feat = np.array([hr_mean, rmssd, pnn50, ibi_range, sdnn, mean_ibi, lf, hf],
-                    dtype=np.float32)
+    # ── Spectral HRV (LF / HF) ───────────────────────────────────────────────
+    lf, hf    = _lf_hf_proxy(ibi)
+    lf_hf     = lf / (hf + 1e-8)
+
+    # ── Poincaré Plot features (SD1 / SD2) ───────────────────────────────────
+    # SD1: short-term variability  SD2: long-term variability
+    # Reference: Brennan et al. 2001
+    sd1       = float(np.sqrt(0.5 * np.mean(diff_ibi ** 2)))
+    sd2       = float(np.sqrt(max(2 * sdnn**2 - 0.5 * np.mean(diff_ibi**2), 0.0)))
+    sd1_sd2   = sd1 / (sd2 + 1e-8)
+
+    feat = np.array([
+        hr_mean, rmssd, pnn50, ibi_range,
+        sdnn, mean_ibi, lf, hf,
+        lf_hf, sd1, sd2, sd1_sd2,
+        nn50, cv
+    ], dtype=np.float32)
     return feat if np.all(np.isfinite(feat)) else None
 
 
@@ -618,13 +753,24 @@ def evaluate(model, loader, device, criterion, use_bvp=False):
     win_acc = float(np.mean(all_preds == all_labels))
     win_f1  = f1_score(all_labels, all_preds, average='macro', zero_division=0)
 
-    # Clip-level: average softmax probabilities over all windows per clip
+    # Clip-level: CONFIDENCE-WEIGHTED averaging of softmax probs
+    # Windows where the model is more confident get proportionally more weight.
+    # Reference: trial_vote_from_probs in FEEL benchmark (Singh et al. 2025)
     clip_preds, clip_true = [], []
     for cid in np.unique(all_cids):
-        mask        = all_cids == cid
-        avg_prob    = all_logits[mask].mean(axis=0)  # (n_classes,)
-        clip_pred   = int(avg_prob.argmax())
-        clip_label  = int(all_labels[mask][0])       # all windows share same label
+        mask          = all_cids == cid
+        clip_probs    = all_logits[mask]           # (N_win, C)
+        win_conf      = clip_probs.max(axis=1)     # max softmax per window
+        # Avoid zero-weight collapse: fall back to uniform if all conf similar
+        conf_range    = win_conf.max() - win_conf.min()
+        if conf_range < 1e-4:
+            weights   = np.ones(len(win_conf))
+        else:
+            weights   = win_conf
+        weights       = weights / weights.sum()
+        avg_prob      = (clip_probs * weights[:, None]).sum(axis=0)   # (C,)
+        clip_pred     = int(avg_prob.argmax())
+        clip_label    = int(all_labels[mask][0])
         clip_preds.append(clip_pred)
         clip_true.append(clip_label)
     clip_acc = float(np.mean(np.array(clip_preds) == np.array(clip_true)))
@@ -710,6 +856,9 @@ def main():
     parser.add_argument("--norm_mode",  type=str,  default='invbase',
                         choices=['zscore', 'invbase'],
                         help="Baseline normalisation: invbase (default) or zscore")
+    parser.add_argument("--use_ea", action="store_true", default=False,
+                        help="Apply Euclidean Alignment per-subject before band-stack "
+                             "(He & Wu 2019, IEEE TNSRE). Reduces inter-subject variability.")
     parser.add_argument("--device",  type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--overfit_test", action="store_true")
@@ -753,37 +902,30 @@ def main():
         return
 
     # ── 2. Load baselines ────────────────────────────────────────────────────
-    print("Step 2 — Loading baseline spectra...")
+    print("Step 2 — Loading baselines...")
     t0 = time.time()
-    baselines_raw = load_baselines_processed(args.data_root, fs=FS)
 
-    # Build per-subject baseline_info for whichever norm_mode is used
     if args.norm_mode == 'zscore':
-        # Extract per-channel μ, σ from raw baseline time-series
-        baseline_info = {}
-        for subj, raw in baselines_raw.items():
-            if raw is None:
-                continue
-            try:
-                arr = np.asarray(raw, dtype=np.float32)
-                if arr.ndim == 2 and arr.shape[0] == 4:
-                    baseline_info[subj] = {
-                        'μ': arr.mean(axis=1).astype(np.float32),
-                        'σ': arr.std(axis=1).astype(np.float32),
-                    }
-                else:
-                    baseline_info[subj] = None
-            except Exception:
-                baseline_info[subj] = None
-        n_covered = sum(1 for v in baseline_info.values() if v is not None)
+        # Load RAW EEG time-series from baseline JSON to get proper μ/σ
+        baselines_raw  = load_baselines_raw(args.data_root)
+        baseline_info  = baselines_raw   # already {subj: {'μ': (4,), 'σ': (4,)}}
+        n_covered      = sum(1 for v in baseline_info.values() if v is not None)
     else:
-        baseline_info = baselines_raw
-        n_covered = sum(1 for s in set(subject_ids) if s in baseline_info)
+        baselines_raw  = load_baselines_processed(args.data_root, fs=FS)
+        baseline_info  = baselines_raw
+        n_covered      = sum(1 for s in set(subject_ids) if s in baseline_info)
 
     n_total = len(set(subject_ids))
     print(f"  norm_mode   : {args.norm_mode}")
     print(f"  Coverage    : {n_covered}/{n_total} subjects have a baseline")
     print(f"  Done in {time.time() - t0:.1f}s\n")
+
+    # ── 2b. Euclidean Alignment (optional) ─────────────────────────────────
+    if args.use_ea:
+        print("Step 2b — Euclidean Alignment (per-subject covariance re-centring)...")
+        t0 = time.time()
+        trials = euclidean_align_subjects(trials, subject_ids)
+        print(f"  Done in {time.time() - t0:.1f}s\n")
 
     # ── 3. Pre-process trials ────────────────────────────────────────────────
     print(f"Step 3 — Pre-processing (clip → {args.norm_mode} → band-stack)...")
