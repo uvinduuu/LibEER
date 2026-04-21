@@ -222,54 +222,77 @@ def process_trial(trial: np.ndarray, baseline_info, fs: float = FS,
 #  Z-score Baseline Loader  (loads raw EEG  —  NOT spectral data)
 # ════════════════════════════════════════════════════════════════════════════
 
-_EEG_COLS = ["RAW_TP9", "RAW_AF7", "RAW_AF8", "RAW_TP10"]
+# Raw EEG channel names — must match what load_baselines_processed uses
+# (imported from invbase.CHANNELS so both functions scan the same JSON keys)
+from invbase import CHANNELS as _RAW_EEG_CHANNELS
 
 
 def load_baselines_raw(data_root: str) -> dict:
     """
     Load raw EEG time-series from BASELINE_MUSE_cleaned.json files and compute
-    per-channel (mu, sigma) for z-score normalisation.
+    per-channel (μ, σ) for z-score normalisation.
 
-    This is the CORRECT approach for z-score -- it uses the actual EEG time-domain
-    signal, NOT the spectral data used by InvBase.
+    Uses the SAME glob patterns as load_baselines_processed() in invbase.py,
+    which is proven to find all 41 baseline files on the Kaggle dataset.
+    Reads channel data as direct top-level JSON keys (obj.get(ch, [])),
+    matching how invbase.py reads the MUSE JSON format.
 
+    Args:
+        data_root: path to the processed Emognition dataset root.
     Returns:
-        dict: subj_str -> {'mu': float32(4,), 'sigma': float32(4,)}
-              or {} if no baseline files found.
+        dict: subj_str -> {'μ': float32(4,), 'σ': float32(4,)}
+              Empty dict if no baseline files are found.
     """
-    import json as _json, glob as _glob, pandas as _pd
+    # Same patterns as load_baselines_processed — proven to find 41 files
+    patterns = [
+        os.path.join(data_root, "*", "*_BASELINE_STIMULUS_MUSE_cleaned",
+                     "*_BASELINE_STIMULUS_MUSE_cleaned.json"),
+        os.path.join(data_root, "*", "*_BASELINE_STIMULUS_MUSE_cleaned.json"),
+        os.path.join(data_root, "**", "*_BASELINE_STIMULUS_MUSE_cleaned.json"),
+    ]
+    files = sorted({p for pat in patterns for p in glob.glob(pat, recursive=True)})
+
+    # Fallback to non-cleaned pattern
+    if not files:
+        orig = [
+            os.path.join(data_root, "*_BASELINE_STIMULUS_MUSE.json"),
+            os.path.join(data_root, "*", "*_BASELINE_STIMULUS_MUSE.json"),
+            os.path.join(data_root, "**", "*_BASELINE_STIMULUS_MUSE.json"),
+        ]
+        files = sorted({p for pat in orig for p in glob.glob(pat, recursive=True)})
+
+    print(f"[load_baselines_raw] Found {len(files)} BASELINE files")
     stats = {}
-    for subj_dir in sorted(glob.glob(os.path.join(data_root, '*'))):
-        if not os.path.isdir(subj_dir):
-            continue
-        sid = os.path.basename(subj_dir)
-        if not sid.isdigit():
-            continue
-        # find BASELINE_MUSE_cleaned.json
-        cands = sorted(glob.glob(os.path.join(subj_dir, '*_BASELINE_MUSE_cleaned.json')))
-        if not cands:
-            continue
-        fp = cands[0]
+
+    for fp in files:
+        # Extract subject ID from filename (same as load_baselines_processed)
+        name = os.path.splitext(os.path.basename(fp))[0]
+        sid  = name.split("_")[0]   # e.g. "22_BASELINE_..." -> "22"
         try:
             with open(fp) as fh:
-                raw = _json.load(fh)
-            if isinstance(raw, dict) and 'data' in raw:
-                df = _pd.DataFrame(raw['data'])
-            elif isinstance(raw, list):
-                df = _pd.DataFrame(raw)
-            else:
-                df = _pd.DataFrame(raw)
-            cols = [c for c in _EEG_COLS if c in df.columns]
-            if len(cols) == 0:
+                obj = json.load(fh)
+            # Read raw EEG channels directly from top-level JSON keys
+            # (same format as invbase.py — NOT wrapped in a DataFrame)
+            raw_ch = []
+            for ch in _RAW_EEG_CHANNELS:
+                arr = np.asarray(obj.get(ch, []), dtype=np.float64)
+                if len(arr) == 0:
+                    raw_ch = []
+                    break
+                raw_ch.append(arr)
+            if len(raw_ch) != len(_RAW_EEG_CHANNELS):
+                print(f"  [load_baselines_raw] {sid}: missing channels in JSON, skipping")
                 continue
-            sig = np.stack([df[c].to_numpy(dtype=np.float64) for c in cols], axis=0)  # (4, T)
+            L   = min(len(a) for a in raw_ch)
+            sig = np.stack([a[:L] for a in raw_ch], axis=0)   # (4, T)
             sig = np.nan_to_num(sig, nan=0.0, posinf=0.0, neginf=0.0)
             mu  = sig.mean(axis=1).astype(np.float32)
             sd  = sig.std(axis=1).astype(np.float32)
-            sd  = np.where(sd < 1e-6, 1.0, sd)   # clamp flat channels
+            sd  = np.where(sd < 1e-6, 1.0, sd)               # clamp flat channels
             stats[sid] = {'μ': mu, 'σ': sd}
         except Exception as e:
             print(f"  [load_baselines_raw] {sid}: {e}")
+
     print(f"[load_baselines_raw] Loaded raw baseline for {len(stats)} subjects")
     return stats
 
@@ -417,10 +440,8 @@ def window_trials(processed_trials, labels, subject_ids,
 #  BVP / Samsung Watch Feature Extraction
 # ════════════════════════════════════════════════════════════════════════════
 
-BVP_DIM      = 14                   # [HR_mean, RMSSD, pNN50, IBI_range,
-                                    #  SDNN, mean_IBI, LF, HF,
-                                    #  LF_HF_ratio, SD1, SD2, SD1_SD2_ratio,
-                                    #  NN50, CV]
+BVP_DIM      = 8                    # [HR_mean, RMSSD, pNN50, IBI_range,
+                                    #  SDNN, mean_IBI, LF_proxy, HF_proxy]
 TARGET_EMOT  = {'ENTHUSIASM', 'FEAR', 'NEUTRAL', 'SADNESS'}
 
 
@@ -460,13 +481,13 @@ def _lf_hf_proxy(ibi: np.ndarray, fs_ibi: float = 4.0):
 
 def load_bvp_features_one(fp):
     """
-    Extract 14 HRV features from one Samsung Watch STIMULUS JSON.
+    Extract 8 HRV features from one Samsung Watch STIMULUS JSON.
 
     Features:
-        [HR_mean, RMSSD, pNN50, IBI_range, SDNN, mean_IBI,
-         LF, HF, LF_HF_ratio, SD1, SD2, SD1_SD2_ratio, NN50, CV]
+        [HR_mean, RMSSD, pNN50, IBI_range,
+         SDNN, mean_IBI, LF_proxy, HF_proxy]
 
-    Returns float32 array (14,) or None.
+    Returns float32 array (8,) or None.
     """
     try:
         with open(fp) as f:
@@ -485,35 +506,18 @@ def load_bvp_features_one(fp):
     if ibi is None or len(ibi) < 5:
         return None
 
-    # ── Basic IBI stats ──────────────────────────────────────────────────────
     diff_ibi  = np.diff(ibi)
     hr_mean   = float(np.mean(hr))   if (hr is not None and len(hr) >= 3) \
                 else float(np.mean(60000.0 / ibi))
     rmssd     = float(np.sqrt(np.mean(diff_ibi ** 2)))
-    nn50      = float(np.sum(np.abs(diff_ibi) > 50))
     pnn50     = float(np.mean(np.abs(diff_ibi) > 50))
     ibi_range = float(ibi.max() - ibi.min())
     sdnn      = float(ibi.std())
     mean_ibi  = float(ibi.mean())
-    cv        = sdnn / (mean_ibi + 1e-8)              # Coefficient of Variation
-
-    # ── Spectral HRV (LF / HF) ───────────────────────────────────────────────
     lf, hf    = _lf_hf_proxy(ibi)
-    lf_hf     = lf / (hf + 1e-8)
 
-    # ── Poincaré Plot features (SD1 / SD2) ───────────────────────────────────
-    # SD1: short-term variability  SD2: long-term variability
-    # Reference: Brennan et al. 2001
-    sd1       = float(np.sqrt(0.5 * np.mean(diff_ibi ** 2)))
-    sd2       = float(np.sqrt(max(2 * sdnn**2 - 0.5 * np.mean(diff_ibi**2), 0.0)))
-    sd1_sd2   = sd1 / (sd2 + 1e-8)
-
-    feat = np.array([
-        hr_mean, rmssd, pnn50, ibi_range,
-        sdnn, mean_ibi, lf, hf,
-        lf_hf, sd1, sd2, sd1_sd2,
-        nn50, cv
-    ], dtype=np.float32)
+    feat = np.array([hr_mean, rmssd, pnn50, ibi_range, sdnn, mean_ibi, lf, hf],
+                    dtype=np.float32)
     return feat if np.all(np.isfinite(feat)) else None
 
 
@@ -753,24 +757,15 @@ def evaluate(model, loader, device, criterion, use_bvp=False):
     win_acc = float(np.mean(all_preds == all_labels))
     win_f1  = f1_score(all_labels, all_preds, average='macro', zero_division=0)
 
-    # Clip-level: CONFIDENCE-WEIGHTED averaging of softmax probs
-    # Windows where the model is more confident get proportionally more weight.
-    # Reference: trial_vote_from_probs in FEEL benchmark (Singh et al. 2025)
+    # Clip-level: equal-weight average of softmax probs over all windows per clip.
+    # Uniform averaging is more robust than confidence-weighting on small test sets
+    # (24 clips), where high-confidence wrong windows can dominate and hurt accuracy.
     clip_preds, clip_true = [], []
     for cid in np.unique(all_cids):
-        mask          = all_cids == cid
-        clip_probs    = all_logits[mask]           # (N_win, C)
-        win_conf      = clip_probs.max(axis=1)     # max softmax per window
-        # Avoid zero-weight collapse: fall back to uniform if all conf similar
-        conf_range    = win_conf.max() - win_conf.min()
-        if conf_range < 1e-4:
-            weights   = np.ones(len(win_conf))
-        else:
-            weights   = win_conf
-        weights       = weights / weights.sum()
-        avg_prob      = (clip_probs * weights[:, None]).sum(axis=0)   # (C,)
-        clip_pred     = int(avg_prob.argmax())
-        clip_label    = int(all_labels[mask][0])
+        mask       = all_cids == cid
+        avg_prob   = all_logits[mask].mean(axis=0)   # (n_classes,)  equal-weight
+        clip_pred  = int(avg_prob.argmax())
+        clip_label = int(all_labels[mask][0])
         clip_preds.append(clip_pred)
         clip_true.append(clip_label)
     clip_acc = float(np.mean(np.array(clip_preds) == np.array(clip_true)))
@@ -858,7 +853,9 @@ def main():
                         help="Baseline normalisation: invbase (default) or zscore")
     parser.add_argument("--use_ea", action="store_true", default=False,
                         help="Apply Euclidean Alignment per-subject before band-stack "
-                             "(He & Wu 2019, IEEE TNSRE). Reduces inter-subject variability.")
+                             "(He & Wu 2019). NOTE: requires ≥10 trials per subject to "
+                             "estimate stable mean covariance. DO NOT use with Emognition "
+                             "(only 4 trials per subject) — will harm performance.")
     parser.add_argument("--device",  type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--overfit_test", action="store_true")
