@@ -389,11 +389,11 @@ def main():
 
         if ep % 10 == 0 or ep == 1:
             print(f'   Ep {ep:3d} | Tr:{tr_acc:.3f} | '
-                  f'Va-win:{va_wf:.3f} Va-clip:{va_cf:.3f} F1:{va_wf1:.3f} | '
+                  f'Va-win:{va_wf:.3f} Va-clip:{va_cf:.3f} F1:{va_cf1:.3f} | '
                   f'lr:{lr:.1e}')
 
-        if va_wf1 > best_val_f1:
-            best_val_f1 = va_wf1
+        if va_cf1 > best_val_f1:
+            best_val_f1 = va_cf1
             best_state  = {k: (v.clone() if torch.is_tensor(v) else v)
                            for k, v in model.state_dict().items()}
             no_improve  = 0
