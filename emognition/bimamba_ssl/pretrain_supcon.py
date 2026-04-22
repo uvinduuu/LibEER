@@ -512,7 +512,7 @@ class BalancedEmotionSampler(torch.utils.data.Sampler):
                     idx, size=self.n_samples_per_class, replace=len(idx) < self.n_samples_per_class)
                 batch.extend(chosen.tolist())
             random.shuffle(batch)
-            yield from batch
+            yield batch
 
     def __len__(self):
         return self.n_batches * self.n_classes_per_batch * self.n_samples_per_class
