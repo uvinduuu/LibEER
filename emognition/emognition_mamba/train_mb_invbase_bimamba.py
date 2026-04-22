@@ -1152,8 +1152,8 @@ def main():
 
             ret = evaluate(fold_model, va_dl, device, eval_crit, use_bvp)
             _, va_acc, va_f1, va_clip_acc, va_clip_f1, _, _, _, _ = ret
-            # Use window-level F1 for early stopping (more stable: 700+ windows vs ~24 clips)
-            monitor_f1 = va_f1
+            # Use clip-level F1 for early stopping — aligns with the key test metric
+            monitor_f1 = va_clip_f1
 
             if epoch % 10 == 0 or epoch == 1:
                 tr_acc = ep_ok / max(ep_tot, 1)
