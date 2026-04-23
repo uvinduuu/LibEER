@@ -893,6 +893,10 @@ def main():
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--overfit_test", action="store_true")
     parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--save_model", type=str, default=None,
+                        help="Path to save the final trained model checkpoint (.pt). "
+                             "Saves a dict with keys: model_state, args, class_names, bvp_dim. "
+                             "Use emognition/bimamba_ssl/inference.py to load and predict.")
 
     args = parser.parse_args()
     setup_seed(args.seed)
@@ -1182,6 +1186,21 @@ def main():
         elif best_st:
             fold_model.load_state_dict(best_st)
         fold_model = fold_model.to(device)
+
+        # Save model checkpoint if requested (sub_indep only — saves the single split model)
+        if getattr(args, 'save_model', None) and fold_name == "":
+            ckpt = {
+                'model_state': {k: v.cpu() for k, v in fold_model.state_dict().items()},
+                'args':        vars(args),
+                'class_names': CLASS_NAMES,
+                'bvp_dim':     BVP_DIM if use_bvp else 0,
+                'use_bvp':     use_bvp,
+                'd_model':     args.d_model,
+                'n_layers':    args.n_layers,
+            }
+            os.makedirs(os.path.dirname(os.path.abspath(args.save_model)), exist_ok=True)
+            torch.save(ckpt, args.save_model)
+            print(f"  [checkpoint] Model saved → {args.save_model}")
 
         ret = evaluate(fold_model, te_dl, device, eval_crit, use_bvp)
         _, te_win_acc, te_win_f1, te_clip_acc, te_clip_f1, \
