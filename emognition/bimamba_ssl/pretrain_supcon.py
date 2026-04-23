@@ -249,6 +249,15 @@ class EEGAugmentor:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         x = x.clone()
+
+        # ── channel-wise z-score normalisation (applied BEFORE augmentation) ──
+        # Keeps per-channel amplitude in ~[-3, 3] regardless of InvBase scaling.
+        # Prevents SSM state explosion at random init and during early training.
+        for c in range(x.shape[0]):
+            s = x[c].std()
+            if s > 1e-8:
+                x[c] = (x[c] - x[c].mean()) / s
+
         C, T = x.shape
 
         # Gaussian noise
@@ -472,17 +481,45 @@ class WarmupCosineScheduler:
         return [pg['lr'] for pg in self.optimizer.param_groups]
 
 
-def train_one_epoch(model, loader, optimizer, scheduler, criterion, device):
+def train_one_epoch(model, loader, optimizer, scheduler, criterion, device,
+                    _diag=[0, 0, 0, 0]):
+    """_diag is a mutable default used for one-time diagnostics across first epoch."""
     model.train()
-    total_loss, n, n_skipped = 0.0, 0, 0
+    total_loss, n = 0.0, 0
+    skip_input = skip_embed = skip_loss = 0
+    first_batch = (_diag[0] == 0)
+
     for v1, v2, labels in loader:
         v1, v2  = v1.to(device), v2.to(device)
         labels  = labels.long().to(device)
 
-        # BatchNorm1d in ConvStem will corrupt ALL 128 samples in a batch
-        # if even one sample has NaN. Guard here as a final safety net.
+        # ── one-time diagnostic on the very first batch ever seen ─────────────
+        if first_batch:
+            first_batch = False
+            _diag[0] += 1
+            print(f'\n  [diag] First batch v1: shape={tuple(v1.shape)}, '
+                  f'min={v1.min():.4g}, max={v1.max():.4g}, '
+                  f'nan={v1.isnan().sum().item()}, inf={v1.isinf().sum().item()}')
+            # Run encoder in no_grad to inspect embeddings without affecting training
+            with torch.no_grad():
+                try:
+                    z_test = model(v1[:4])   # just 4 samples to keep it fast
+                    print(f'  [diag] z_test (4 samples): '
+                          f'nan={z_test.isnan().sum().item()}, '
+                          f'inf={z_test.isinf().sum().item()}, '
+                          f'min={z_test.min():.4g}, max={z_test.max():.4g}')
+                    # Per-layer diagnostics
+                    x = v1[:4]
+                    x = model.encoder.channel_attn(x)
+                    print(f'  [diag] after channel_attn: nan={x.isnan().sum().item()}, max={x.abs().max():.4g}')
+                    x = model.encoder.conv_stem(x)
+                    print(f'  [diag] after conv_stem   : nan={x.isnan().sum().item()}, max={x.abs().max():.4g}')
+                except Exception as e:
+                    print(f'  [diag] forward error: {e}')
+            print()
+
         if not (torch.isfinite(v1).all() and torch.isfinite(v2).all()):
-            n_skipped += 1
+            skip_input += 1
             continue
 
         optimizer.zero_grad()
@@ -490,13 +527,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device):
         z2 = model(v2)
 
         if not (torch.isfinite(z1).all() and torch.isfinite(z2).all()):
-            n_skipped += 1
+            skip_embed += 1
             optimizer.zero_grad()
             continue
 
         loss = criterion(z1, z2, labels)
         if not torch.isfinite(loss):
-            n_skipped += 1
+            skip_loss += 1
             optimizer.zero_grad()
             continue
 
@@ -508,8 +545,10 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device):
         n          += 1
 
     scheduler.step()
-    if n_skipped > 0:
-        print(f'    [warn] {n_skipped}/{n+n_skipped} batches skipped (NaN/inf)')
+    total_skip = skip_input + skip_embed + skip_loss
+    if total_skip > 0:
+        print(f'    [warn] {total_skip}/{n+total_skip} batches skipped  '
+              f'(input-NaN={skip_input}, embed-NaN={skip_embed}, loss-NaN={skip_loss})')
     return total_loss / max(n, 1)
 
 
