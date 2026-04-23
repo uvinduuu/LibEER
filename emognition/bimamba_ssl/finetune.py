@@ -296,6 +296,14 @@ def main():
             print(f'  [info] Full checkpoint detected — using nested encoder weights')
         else:
             state = ckpt
+        # Strip classifier head: pre-training used num_classes=11 (all emotions)
+        # but the fine-tune backbone expects num_classes=4. The head is re-initialised
+        # from scratch so there is no information loss by dropping these keys.
+        head_keys = [k for k in state if k.startswith('head.')]
+        for k in head_keys:
+            del state[k]
+        if head_keys:
+            print(f'  [info] Dropped pre-train head keys (wrong num_classes): {head_keys}')
         missing, unexpected = backbone.load_state_dict(state, strict=False)
         if missing:
             print(f'  [warn] missing keys   : {missing}')
