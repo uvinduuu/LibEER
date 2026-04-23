@@ -720,6 +720,12 @@ def main():
                                criterion, device)
         lr   = scheduler.get_last_lr()[0]
 
+        # Guard: nan loss means weights are corrupt — print warning and skip save
+        if math.isnan(loss):
+            if ep % 5 == 0 or ep == 1:
+                print(f'  {ep:6d}    {"NaN — skipped":>12}    {lr:.2e}  ⚠ check temperature/BN')
+            continue
+
         if ep % 5 == 0 or ep == 1:
             print(f'  {ep:6d}    {loss:12.6f}    {lr:.2e}')
 
@@ -729,11 +735,31 @@ def main():
                            for k, v in encoder.state_dict().items()}
             os.makedirs(args.save_dir, exist_ok=True)
             torch.save(best_enc_sd, enc_path)
-            print(f'  [checkpoint] Encoder saved → {enc_path}')
+            print(f'  [checkpoint] Encoder saved → {enc_path}  (loss={loss:.6f})')
 
     elapsed = time.time() - t0_total
     print(f'\n  Pre-training complete in {elapsed/60:.1f} min')
+
+    # Fallback: if loss was nan every epoch, best_enc_sd is None.
+    # Save the final model weights as a last resort so finetune.py gets real tensors.
+    if best_enc_sd is None:
+        print('  ⚠  WARNING: loss was NaN for all epochs — encoder was never checkpointed.')
+        print('  ⚠  Saving final (random-init) encoder as fallback.')
+        print('  ⚠  Fix: re-run with higher --temperature (e.g. 0.3) and LayerNorm in head.')
+        best_enc_sd = {k: v.cpu().clone() for k, v in encoder.state_dict().items()}
+        best_loss   = float('nan')
+        os.makedirs(args.save_dir, exist_ok=True)
+        torch.save(best_enc_sd, enc_path)
+
     print(f'  Best SupCon loss : {best_loss:.6f}')
+
+    # Verify no NaN in saved encoder
+    nan_count = sum(int(torch.isnan(v).sum()) for v in best_enc_sd.values()
+                    if isinstance(v, torch.Tensor))
+    total_params = sum(v.numel() for v in best_enc_sd.values()
+                       if isinstance(v, torch.Tensor))
+    nan_status = '✓ CLEAN' if nan_count == 0 else f'✗ {nan_count}/{total_params} NaN — weights corrupt!'
+    print(f'  Encoder NaN check: {nan_status}')
 
     # Save full checkpoint
     full_path = os.path.join(args.save_dir, 'pretrained_supcon_full.pt')
