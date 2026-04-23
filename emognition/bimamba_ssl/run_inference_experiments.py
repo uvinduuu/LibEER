@@ -395,7 +395,8 @@ def main():
     parser.add_argument('--seed',     type=int, default=42)
     parser.add_argument('--save_dir', default='/kaggle/working')
     parser.add_argument('--device',
-                        default='cuda' if torch.cuda.is_available() else 'cpu')    # ── inference-only mode ────────────────────────────────────────────────────────
+                        default='cuda' if torch.cuda.is_available() else 'cpu')
+    # ── inference-only mode ────────────────────────────────────────────────────────
     parser.add_argument(
         '--load_checkpoints', action='store_true',
         help='Skip training entirely and load the three checkpoint files from '
@@ -409,7 +410,8 @@ def main():
         help='Override checkpoint path for Setup 2 (default: <save_dir>/model_setup2_partial.pt)')
     parser.add_argument(
         '--ckpt_setup3', default=None,
-        help='Override checkpoint path for Setup 3 (default: <save_dir>/model_setup3_full.pt)')    args = parser.parse_args()
+        help='Override checkpoint path for Setup 3 (default: <save_dir>/model_setup3_full.pt)')
+    args = parser.parse_args()
 
     setup_seed(args.seed)
     device       = torch.device(args.device)
