@@ -286,7 +286,16 @@ def main():
 
     if args.pretrained:
         print(f'  Loading: {args.pretrained}')
-        state = torch.load(args.pretrained, map_location='cpu')
+        ckpt = torch.load(args.pretrained, map_location='cpu')
+        # Support both:
+        #   (a) plain encoder state_dict  (from pretrain_supcon.py enc_path)
+        #   (b) full checkpoint dict      (from pretrain_supcon.py full_path)
+        #       which has keys: 'encoder', 'projector', 'emot2id', 'args', 'best_loss'
+        if isinstance(ckpt, dict) and 'encoder' in ckpt:
+            state = ckpt['encoder']
+            print(f'  [info] Full checkpoint detected — using nested encoder weights')
+        else:
+            state = ckpt
         missing, unexpected = backbone.load_state_dict(state, strict=False)
         if missing:
             print(f'  [warn] missing keys   : {missing}')

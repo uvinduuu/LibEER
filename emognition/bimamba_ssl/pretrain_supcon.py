@@ -302,6 +302,8 @@ class ProjectionHead(nn.Module):
             nn.BatchNorm1d(d_model * 2),
             nn.ReLU(inplace=True),
             nn.Linear(d_model * 2, proj_dim),
+            nn.LayerNorm(proj_dim),   # stabilises norm before F.normalize; prevents
+                                      # div-by-~0 on random init with low temperature
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -549,8 +551,10 @@ def main():
     parser.add_argument('--proj_dim',       type=int,   default=64)
 
     # ── SupCon loss ───────────────────────────────────────────────────────────
-    parser.add_argument('--temperature',      type=float, default=0.1,
-                        help='SupCon temperature τ — lower=harder (default 0.1)')
+    parser.add_argument('--temperature',      type=float, default=0.3,
+                        help='SupCon temperature τ — lower=harder (default 0.3; '
+                             'use 0.1 only after a stable warm-up; '
+                             'τ=0.1 on random-init EEG causes NaN via BatchNorm instability)')
 
     # ── batch composition ─────────────────────────────────────────────────────
     parser.add_argument('--n_classes_per_batch',  type=int, default=8,
