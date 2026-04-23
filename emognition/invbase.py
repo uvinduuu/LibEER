@@ -288,15 +288,33 @@ def apply_invbase_to_raw(trial, baseline_spectrum, fs=FS):
     # Match baseline frequency bins to the trial's frequency resolution
     n_base = baseline_spectrum.shape[1]
     if n_base == n_freq:
-        baseline = np.maximum(baseline_spectrum.astype(np.float64), 1e-10)
+        baseline = baseline_spectrum.astype(np.float64).copy()
     else:
         from scipy.interpolate import interp1d
         old_freqs = np.linspace(0.0, fs / 2.0, n_base)
         baseline  = np.zeros((C, n_freq), dtype=np.float64)
         for c in range(C):
-            f_interp   = interp1d(old_freqs, baseline_spectrum[c].astype(np.float64),
-                                  kind="linear", fill_value="extrapolate")
-            baseline[c] = np.maximum(f_interp(freqs), 1e-10)
+            f_interp    = interp1d(old_freqs, baseline_spectrum[c].astype(np.float64),
+                                   kind="linear", fill_value="extrapolate")
+            baseline[c] = f_interp(freqs)
+
+    # Relative floor: clamp each channel's baseline to 1% of its own mean power.
+    #
+    # WHY: The old floor was an absolute constant (1e-10). Brain signals exist
+    # only in 1-45 Hz; above 45 Hz the baseline power is naturally near zero.
+    # Dividing by sqrt(1e-10) ≈ 3e-6 amplified out-of-band noise by ~1e5,
+    # producing float32-overflow / inf values in the time-domain signal.
+    # Those inf values made augmentor std = inf, and 0.0 * inf = NaN (IEEE 754),
+    # silently corrupting every batch that contained one of these windows.
+    #
+    # A relative floor = 1% of mean power ensures out-of-band bins where the
+    # brain genuinely has no activity are normalised to ~sqrt(100)=10× at most,
+    # rather than millions-fold. In-band bins (1-45 Hz) are unaffected because
+    # their power >> 1% of the mean.
+    for c in range(C):
+        floor_c     = 0.01 * np.mean(baseline[c])        # 1% of mean per channel
+        floor_c     = max(floor_c, 1e-10)                 # absolute safety net
+        baseline[c] = np.maximum(baseline[c], floor_c)
 
     # InvBase: divided amplitude, preserved phase
     #   normalized_amplitude = |fft| / sqrt(baseline_power)

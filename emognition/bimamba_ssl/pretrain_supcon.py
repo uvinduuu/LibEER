@@ -160,7 +160,7 @@ def load_all_labeled_trials(data_root: str, fs: int = FS, min_sec: float = 4.0):
         try:
             with open(fp) as f:
                 obj = json.load(f)
-            raw_ch = [np.asarray(obj.get(ch, []), dtype=np.float32)
+            raw_ch = [np.asarray(obj.get(ch, []), dtype=np.float64)
                       for ch in _EEG_CHANNELS]
             if any(len(a) == 0 for a in raw_ch):
                 n_skip += 1
@@ -169,8 +169,30 @@ def load_all_labeled_trials(data_root: str, fs: int = FS, min_sec: float = 4.0):
             if L < fs * min_sec:
                 n_skip += 1
                 continue
-            trial = np.stack(raw_ch, axis=0)[:, :L]
-            trial = np.nan_to_num(trial, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # ── Quality mask (same as supervised emognition_processed_loader) ──
+            # Keeps only samples where headband is on AND all HSI channels ≤ 2.
+            # Without this, SURPRISE/DISGUST trials include headset-movement
+            # artifacts with huge high-frequency noise that overflows InvBase.
+            _QUALITY_CHANNELS = ['HSI_TP9', 'HSI_AF7', 'HSI_AF8', 'HSI_TP10']
+            mask = np.ones(L, dtype=bool)
+            for arr in raw_ch:
+                mask &= np.isfinite(arr[:L])
+            head_on = np.asarray(obj.get('HeadBandOn', []), dtype=np.float64)[:L]
+            if len(head_on) == L:
+                mask &= (head_on == 1)
+                for qch in _QUALITY_CHANNELS:
+                    hsi = np.asarray(obj.get(qch, []), dtype=np.float64)[:L]
+                    if len(hsi) == L:
+                        mask &= np.isfinite(hsi) & (hsi <= 2)
+            raw_ch = [a[:L][mask] for a in raw_ch]
+            L = min(len(a) for a in raw_ch)
+            if L < fs * min_sec:
+                n_skip += 1
+                continue
+
+            trial = np.stack(raw_ch, axis=0).astype(np.float32)   # (4, L)
+            trial = trial - trial.mean(axis=1, keepdims=True)       # DC removal
             trials.append(trial)
             emotions.append(emot)
             sids.append(sid)
@@ -270,7 +292,7 @@ class SupConDataset(Dataset):
     """
 
     def __init__(self, windows: list, labels: list, augmentor: EEGAugmentor):
-        self.windows   = [torch.from_numpy(w) for w in windows]
+        self.windows   = [torch.from_numpy(w.astype(np.float32)) for w in windows]
         self.labels    = labels   # list of int
         self.augmentor = augmentor
 
@@ -297,13 +319,16 @@ class ProjectionHead(nn.Module):
 
     def __init__(self, d_model: int, proj_dim: int = 64):
         super().__init__()
+        # Use LayerNorm instead of BatchNorm1d:
+        # - BN depends on batch statistics → unstable with heterogeneous EEG classes
+        # - LN normalises per-sample → no batch-size or class-distribution sensitivity
         self.net = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
-            nn.BatchNorm1d(d_model * 2),
+            nn.LayerNorm(d_model * 2),
             nn.ReLU(inplace=True),
             nn.Linear(d_model * 2, proj_dim),
-            nn.LayerNorm(proj_dim),   # stabilises norm before F.normalize; prevents
-                                      # div-by-~0 on random init with low temperature
+            nn.LayerNorm(proj_dim),   # ensures |z| ≈ sqrt(proj_dim) before F.normalize
+                                      # → prevents div-by-~0 at random init
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
