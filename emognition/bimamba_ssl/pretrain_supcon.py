@@ -388,6 +388,11 @@ class SupConLoss(nn.Module):
         N      = z1.shape[0]
         device = z1.device
 
+        assert torch.isfinite(z1).all(), f'SupConLoss: z1 has NaN/inf'
+        assert torch.isfinite(z2).all(), f'SupConLoss: z2 has NaN/inf'
+        assert z1.shape == z2.shape, f'Shape mismatch: {z1.shape} vs {z2.shape}'
+        assert labels.shape[0] == N, f'Labels batch size mismatch'
+
         # Concatenate views: (2N, proj_dim)
         z      = torch.cat([z1, z2], dim=0)                       # (2N, D)
         labels = torch.cat([labels, labels], dim=0)               # (2N,)
@@ -415,12 +420,27 @@ class SupConLoss(nn.Module):
         # log p(i,j) = sim(i,j)/τ - log_denom[i]
         log_prob  = sim - log_denom.unsqueeze(1)                  # (2N, 2N)
 
-        # Mean log-prob over positives per anchor
+        # Mean log-prob over positives per anchor.
+        # CRITICAL: use torch.where instead of `log_prob * pos_mask.float()`.
+        # The diagonal of log_prob is -inf (from self-mask above).
+        # pos_mask is False (= 0.0) on the diagonal.
+        # IEEE 754: -inf * 0.0 = NaN  →  every loss value is NaN.
+        # torch.where selects 0.0 at non-positive positions without multiplying.
+        safe_log_prob = torch.where(pos_mask, log_prob,
+                                    torch.zeros_like(log_prob))   # (2N, 2N)
         n_pos     = pos_mask.float().sum(dim=1).clamp(min=1.0)    # (2N,)
-        loss_per  = -(log_prob * pos_mask.float()).sum(dim=1) / n_pos  # (2N,)
+        loss_per  = -safe_log_prob.sum(dim=1) / n_pos             # (2N,)
 
         # Average only over anchors that have at least one positive
         loss = loss_per[has_pos].mean()
+
+        assert torch.isfinite(loss), (
+            f'SupConLoss produced NaN/inf: '
+            f'safe_log_prob range=[{safe_log_prob[pos_mask].min():.3g}, '
+            f'{safe_log_prob[pos_mask].max():.3g}], '
+            f'n_pos range=[{n_pos.min():.1f}, {n_pos.max():.1f}], '
+            f'sim range=[{sim[~self_mask].min():.3g}, {sim[~self_mask].max():.3g}]'
+        )
         return loss
 
 
@@ -531,7 +551,13 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device,
             optimizer.zero_grad()
             continue
 
-        loss = criterion(z1, z2, labels)
+        try:
+            loss = criterion(z1, z2, labels)
+        except AssertionError as e:
+            print(f'\n  [ERROR] SupConLoss assertion failed: {e}')
+            skip_loss += 1
+            optimizer.zero_grad()
+            continue
         if not torch.isfinite(loss):
             skip_loss += 1
             optimizer.zero_grad()
