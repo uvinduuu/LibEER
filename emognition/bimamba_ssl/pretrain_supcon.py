@@ -856,10 +856,8 @@ def main():
 
         if loss < best_loss:
             best_loss   = loss
-            # Exclude 'head.*' — pre-trained with 11 classes; fine-tune rebuilds head for 4
             best_enc_sd = {k: v.cpu().clone()
-                           for k, v in encoder.state_dict().items()
-                           if not k.startswith('head.')}
+                           for k, v in encoder.state_dict().items()}
             os.makedirs(args.save_dir, exist_ok=True)
             torch.save(best_enc_sd, enc_path)
             print(f'  [checkpoint] Encoder saved → {enc_path}  (loss={loss:.6f})')
@@ -873,8 +871,7 @@ def main():
         print('  ⚠  WARNING: loss was NaN for all epochs — encoder was never checkpointed.')
         print('  ⚠  Saving final (random-init) encoder as fallback.')
         print('  ⚠  Fix: re-run with higher --temperature (e.g. 0.3) and LayerNorm in head.')
-        best_enc_sd = {k: v.cpu().clone() for k, v in encoder.state_dict().items()
-                       if not k.startswith('head.')}
+        best_enc_sd = {k: v.cpu().clone() for k, v in encoder.state_dict().items()}
         best_loss   = float('nan')
         os.makedirs(args.save_dir, exist_ok=True)
         torch.save(best_enc_sd, enc_path)
