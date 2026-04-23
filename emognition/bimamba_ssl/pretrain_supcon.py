@@ -474,15 +474,32 @@ class WarmupCosineScheduler:
 
 def train_one_epoch(model, loader, optimizer, scheduler, criterion, device):
     model.train()
-    total_loss, n = 0.0, 0
+    total_loss, n, n_skipped = 0.0, 0, 0
     for v1, v2, labels in loader:
         v1, v2  = v1.to(device), v2.to(device)
         labels  = labels.long().to(device)
 
+        # BatchNorm1d in ConvStem will corrupt ALL 128 samples in a batch
+        # if even one sample has NaN. Guard here as a final safety net.
+        if not (torch.isfinite(v1).all() and torch.isfinite(v2).all()):
+            n_skipped += 1
+            continue
+
         optimizer.zero_grad()
-        z1   = model(v1)
-        z2   = model(v2)
+        z1 = model(v1)
+        z2 = model(v2)
+
+        if not (torch.isfinite(z1).all() and torch.isfinite(z2).all()):
+            n_skipped += 1
+            optimizer.zero_grad()
+            continue
+
         loss = criterion(z1, z2, labels)
+        if not torch.isfinite(loss):
+            n_skipped += 1
+            optimizer.zero_grad()
+            continue
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -491,6 +508,8 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device):
         n          += 1
 
     scheduler.step()
+    if n_skipped > 0:
+        print(f'    [warn] {n_skipped}/{n+n_skipped} batches skipped (NaN/inf)')
     return total_loss / max(n, 1)
 
 
@@ -645,11 +664,19 @@ def main():
     print('Step 3 — Pre-processing (clip → invbase → band-stack)...')
     t0 = time.time()
     processed = []
+    n_nan_trials = 0
     for i, (trial, sid) in enumerate(zip(trials, sids)):
         proc = process_trial(trial, baselines.get(sid, None), fs=FS)
+        # Hard sanitization: nan/inf from filtfilt edge effects or invbase overflow
+        # get zeroed here so they never reach the encoder
+        if not np.isfinite(proc).all():
+            n_nan_trials += 1
+            proc = np.nan_to_num(proc, nan=0.0, posinf=0.0, neginf=0.0)
         processed.append(proc)
         if (i + 1) % 50 == 0 or (i + 1) == len(trials):
             print(f'  {i+1}/{len(trials)} processed...', end='\r')
+    if n_nan_trials:
+        print(f'\n  ⚠  {n_nan_trials} trials had NaN/inf after preprocessing — zeroed out')
     print(f'\n  Done in {time.time()-t0:.1f}s\n')
 
     # ── Step 4: Window with labels ───────────────────────────────────────────
@@ -658,6 +685,14 @@ def main():
     windows, window_emots = slice_windows_labeled(processed, emotions,
                                                    window_size, step)
     window_labels = [emot2id[e] for e in window_emots]
+
+    # Post-windowing NaN scan — reports any survivors so we know the data is clean
+    n_nan_windows = sum(1 for w in windows if not np.isfinite(w).all())
+    if n_nan_windows:
+        print(f'  ⚠  {n_nan_windows}/{len(windows)} windows still have NaN/inf — zeroing')
+        windows = [np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0) for w in windows]
+    else:
+        print(f'  ✓  All {len(windows)} windows are finite')
 
     # Print per-class window counts
     from collections import Counter
