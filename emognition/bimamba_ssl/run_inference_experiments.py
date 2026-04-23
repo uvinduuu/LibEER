@@ -285,6 +285,55 @@ def infer_on_clips(model, clips, use_bvp: bool, device: torch.device,
     return win_acc, clip_acc, clip_f1, per_clip
 
 
+def infer_on_windowed_records(model, test_records: list, use_bvp: bool,
+                              device: torch.device, batch_size: int = 64):
+    """
+    Inference for Setup 3: each test_record holds pre-sliced windows
+    (the last 20% of a clip's windows).  Returns (win_acc, clip_acc, clip_f1, per_clip).
+    """
+    model.eval()
+    all_win_preds, all_win_labels = [], []
+    per_clip = []
+    with torch.no_grad():
+        for rec in test_records:
+            wins = rec['wins']
+            if not wins:
+                continue
+            x   = torch.from_numpy(np.stack(wins)).float()
+            N   = x.shape[0]
+            bvp = (torch.from_numpy(rec['bvp']).float().unsqueeze(0).expand(N, -1)
+                   if use_bvp else None)
+            all_logits = []
+            for i in range(0, N, batch_size):
+                xb  = x[i:i + batch_size].to(device)
+                bb  = bvp[i:i + batch_size].to(device) if use_bvp else None
+                out = model(xb, bb) if use_bvp else model(xb)
+                all_logits.append(out.cpu())
+            logits   = torch.cat(all_logits, dim=0)
+            win_pred = logits.argmax(dim=1).numpy().tolist()
+            all_win_preds.extend(win_pred)
+            all_win_labels.extend([rec['lbl']] * N)
+            probs     = F.softmax(logits, dim=-1).mean(dim=0).numpy()
+            clip_pred = int(probs.argmax())
+            per_clip.append({
+                'emotion':    rec['emotion'],
+                'clip_idx':   rec['clip_idx'],
+                'true_label': rec['lbl'],
+                'pred_label': clip_pred,
+                'correct':    clip_pred == rec['lbl'],
+                'probs':      probs,
+                'pid':        rec['pid'],
+                'folder':     rec['folder'],
+            })
+    win_acc  = float(np.mean(
+        np.array(all_win_preds) == np.array(all_win_labels))) if all_win_labels else 0.0
+    clip_acc = float(np.mean([r['correct'] for r in per_clip])) if per_clip else 0.0
+    clip_f1  = f1_score([r['true_label'] for r in per_clip],
+                         [r['pred_label'] for r in per_clip],
+                         average='macro', zero_division=0) if per_clip else 0.0
+    return win_acc, clip_acc, clip_f1, per_clip
+
+
 def print_clip_results(per_clip: list, title: str):
     """Print a formatted per-clip prediction table, grouped by participant."""
     print(f'\n  {"─"*66}')
@@ -546,9 +595,59 @@ def main():
             bvps.extend(b); cids.extend(c)
         return wins, lbls, bvps, cids
 
+    def split_clip_windows_leakage(clips, train_frac: float = 0.8,
+                                   step_train: int = None):
+        """
+        Setup 3 leakage split: for each clip, window with overlap and assign
+        first train_frac fraction of windows to training, the rest to test.
+        Returns (tr_wins, tr_lbls, tr_bvps, tr_cids, test_records).
+        test_records is a list of dicts for infer_on_windowed_records().
+        """
+        if step_train is None:
+            step_train = WINDOW_SIZE // 2
+        tr_wins, tr_lbls, tr_bvps, tr_cids = [], [], [], []
+        test_records = []
+        base_cid = 20000   # different offset from clips_to_windows (10000)
+        for cid_off, clip in enumerate(clips):
+            T      = clip.eeg.shape[1]
+            starts = list(range(0, max(T - WINDOW_SIZE + 1, 1), step_train))
+            n_tr   = max(1, int(len(starts) * train_frac))
+            cid    = base_cid + cid_off
+            for s in starts[:n_tr]:
+                w = clip.eeg[:, s:s + WINDOW_SIZE]
+                if w.shape[1] < WINDOW_SIZE:
+                    w = np.pad(w, ((0, 0), (0, WINDOW_SIZE - w.shape[1])))
+                tr_wins.append(w.astype(np.float32))
+                tr_lbls.append(clip.label)
+                tr_bvps.append(clip.bvp.astype(np.float32))
+                tr_cids.append(cid)
+            test_ws = []
+            for s in (starts[n_tr:] if len(starts) > n_tr else starts[-1:]):
+                w = clip.eeg[:, s:s + WINDOW_SIZE]
+                if w.shape[1] < WINDOW_SIZE:
+                    w = np.pad(w, ((0, 0), (0, WINDOW_SIZE - w.shape[1])))
+                test_ws.append(w.astype(np.float32))
+            test_records.append({
+                'wins':     test_ws,
+                'lbl':      clip.label,
+                'bvp':      clip.bvp.astype(np.float32),
+                'pid':      clip.pid,
+                'folder':   clip.folder,
+                'emotion':  clip.emotion,
+                'clip_idx': clip.clip_idx,
+            })
+        return tr_wins, tr_lbls, tr_bvps, tr_cids, test_records
+
     # ══════════════════════════════════════════════════════════════════════════
     #  Run all three setups
     # ══════════════════════════════════════════════════════════════════════════
+
+    # Pre-compute Setup 3 leakage training windows (first 50% per clip, same overlap step)
+    lk_tr_wins, lk_tr_lbls, lk_tr_bvps, lk_tr_cids, _lk_unused = \
+        split_clip_windows_leakage(all_clips, train_frac=0.5, step_train=step_tr)
+    print(f'\n    Leakage pre-split (Setup 3): '
+          f'{len(lk_tr_wins)} train windows from first 50% of each clip '
+          f'({len(all_clips)} clips); test = all {len(all_clips)} clips (full)')
 
     results_summary = {}   # setup_name → (win_acc, clip_acc, clip_f1)
 
@@ -568,11 +667,11 @@ def main():
             'ckpt_file':    'model_setup2_partial.pt',
         },
         {
-            'name':         'Setup 3 — Full (all inference clips in train)',
-            'key':          'setup3',
-            'extra_clips':  all_clips,             # all clips in training
-            'test_clips':   all_clips,             # test same clips (intentional)
-            'ckpt_file':    'model_setup3_full.pt',
+            'name':       'Setup 3 — Leakage (first 50% windows in train, test all clips)',
+            'key':        'setup3',
+            'leakage':    True,       # first 50% of each clip's windows added to training
+            'test_clips': all_clips,  # test on ALL clips (full evaluation)
+            'ckpt_file':  'model_setup3_full.pt',
         },
     ]
 
@@ -597,7 +696,19 @@ def main():
             model, use_bvp = load_model_from_checkpoint(ckpt_path, device)
         else:
             # ── Normal: build training set, train, save checkpoint ────────
-            if setup['extra_clips']:
+            if setup.get('leakage'):
+                final_tr_wins = tr_wins + lk_tr_wins
+                final_tr_lbls = tr_wlbls + lk_tr_lbls
+                final_tr_bvps = tr_wbvp  + lk_tr_bvps
+                final_tr_cids = tr_cids  + lk_tr_cids
+                n_test_parts  = len(set(c.pid for c in setup['test_clips']))
+                print(f'  Training: {len(tr_wins)} orig + '
+                      f'{len(lk_tr_wins)} inference (first 50% windows/clip) '
+                      f'= {len(final_tr_wins)} windows')
+                print(f'  Val    : {len(va_wins)} windows')
+                print(f'  Test   : {len(setup["test_clips"])} inference clips (all, '
+                      f'{n_test_parts} participant(s)) ← intentional leakage')
+            elif setup.get('extra_clips'):
                 extra_wins, extra_lbls, extra_bvps, extra_cids = clips_to_windows(
                     setup['extra_clips'], step=step_tr)
                 final_tr_wins = tr_wins + extra_wins
@@ -606,16 +717,18 @@ def main():
                 final_tr_cids = tr_cids  + extra_cids
                 print(f'  Training: {len(tr_wins)} orig + '
                       f'{len(extra_wins)} inference = {len(final_tr_wins)} windows')
+                print(f'  Val    : {len(va_wins)} windows')
+                print(f'  Test   : {len(setup["test_clips"])} inference clips '
+                      f'from {len(set(c.pid for c in setup["test_clips"]))} participant(s)')
             else:
                 final_tr_wins = tr_wins
                 final_tr_lbls = tr_wlbls
                 final_tr_bvps = tr_wbvp
                 final_tr_cids = tr_cids
                 print(f'  Training: {len(tr_wins)} orig windows (no inference participants)')
-
-            print(f'  Val    : {len(va_wins)} windows')
-            print(f'  Test   : {len(setup["test_clips"])} inference clips '
-                  f'from {len(set(c.pid for c in setup["test_clips"]))} participant(s)')
+                print(f'  Val    : {len(va_wins)} windows')
+                print(f'  Test   : {len(setup["test_clips"])} inference clips '
+                      f'from {len(set(c.pid for c in setup["test_clips"]))} participant(s)')
             print()
 
             model, best_val_f1 = train_model(
@@ -635,7 +748,7 @@ def main():
             }, ckpt_path)
             print(f'\n  [checkpoint] saved → {ckpt_path}')
 
-        # Inference on test clips
+        # Inference on test clips (Setup 3 also uses infer_on_clips — full clip eval)
         win_acc, clip_acc, clip_f1, per_clip = infer_on_clips(
             model, setup['test_clips'], use_bvp, device)
 
