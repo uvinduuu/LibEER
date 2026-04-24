@@ -7,7 +7,9 @@ Input file formats
 EEG CSV  :  {emotion}{clip_id}_{name}_eeg_cleaned.csv
   Columns: TimeStamp, Delta_TP9..Gamma_TP10 (20 band-ch), RAW_TP9..TP10,
            HeadBandOn, HSI_TP9..TP10, ...
-  → Reads the 20 already-filtered band columns directly (no InvBase needed).
+  → Reads RAW_TP9/AF7/AF8/TP10, applies artefact clipping + Butterworth
+    band-stack (matching training pipeline) + per-channel z-score
+    (compensates for missing InvBase normalization).
 
 PPG CSV  :  {emotion}{clip_id}_{name}_ppg_hr_ibi_cleaned.csv
   Columns: ppg_timestamp_ms, ppg_timestamp_readable, ppg_green, time_s
@@ -44,8 +46,64 @@ import glob
 
 import numpy as np
 import pandas as pd
+from scipy.signal import butter, filtfilt
 
-# ── EEG band column order (matches training pipeline output) ─────────────────
+# ── Raw EEG channel order (must match training pipeline: CHANNELS in config.py)
+RAW_EEG_COLS = ['RAW_TP9', 'RAW_AF7', 'RAW_AF8', 'RAW_TP10']
+
+# ── Band ranges matching invbase.INVBASE_BAND_HZ (training pipeline) ────────
+_BAND_HZ = [
+    ('delta',  1.0,  3.0),
+    ('theta',  4.0,  7.0),
+    ('alpha',  8.0, 13.0),
+    ('beta',  14.0, 30.0),
+    ('gamma', 31.0, 45.0),
+]
+
+
+def _butter_band(lo: float, hi: float, fs: float, order: int = 4):
+    nyq  = fs / 2.0
+    low  = float(np.clip(lo / nyq, 1e-6, 1.0 - 1e-6))
+    high = float(np.clip(hi / nyq, 1e-6, 1.0 - 1e-6))
+    return butter(order, [low, high], btype='band')
+
+
+def _clip_artefacts(trial: np.ndarray, n_sigma: float = 5.0) -> np.ndarray:
+    """Clip per-channel outliers to ±n_sigma × std (same as training)."""
+    trial = trial.astype(np.float64, copy=True)
+    for c in range(trial.shape[0]):
+        s = trial[c].std()
+        if s > 1e-8:
+            trial[c] = np.clip(trial[c], -n_sigma * s, n_sigma * s)
+    return trial.astype(np.float32)
+
+
+def _band_stack(trial: np.ndarray, fs: float = 256.0,
+               order: int = 4) -> np.ndarray:
+    """
+    Butterworth band-stack: matches apply_band_stack() in training pipeline.
+    Input:  (4, T)  artefact-clipped raw EEG
+    Output: (20, T) band-filtered amplitude time series
+    """
+    bands = []
+    for (_, lo, hi) in _BAND_HZ:
+        b, a = _butter_band(lo, hi, fs, order)
+        bands.append(filtfilt(b, a, trial, axis=1).astype(np.float32))
+    return np.concatenate(bands, axis=0)   # (4*5, T) = (20, T)
+
+
+def _zscore_clip(arr: np.ndarray) -> np.ndarray:
+    """
+    Per-channel z-score normalization over the full clip.
+    Compensates for the missing InvBase baseline normalization.
+    """
+    m = arr.mean(axis=1, keepdims=True)
+    s = arr.std(axis=1, keepdims=True)
+    s = np.where(s < 1e-8, 1.0, s)
+    return ((arr - m) / s).astype(np.float32)
+
+
+# ── EEG band column order kept for reference (not used for loading any more) ─
 EEG_BAND_COLS = [
     'Delta_TP9',  'Delta_AF7',  'Delta_AF8',  'Delta_TP10',
     'Theta_TP9',  'Theta_AF7',  'Theta_AF8',  'Theta_TP10',
@@ -123,19 +181,20 @@ def parse_clip_info(filename: str):
 
 def load_eeg_csv(fp: str, min_sec: float = 4.0, fs: float = 256.0) -> np.ndarray:
     """
-    Load the 20 band columns from an EEG CSV.
+    Load and process raw EEG from a CSV file into the model's expected format.
 
-    Applies quality mask (HeadBandOn==1, HSI ≤ 2) to remove headband-off
-    periods, then returns (20, T) float32.
+    Pipeline (matches training):
+      1. Read RAW_TP9/AF7/AF8/TP10 with quality mask (HeadBandOn==1, HSI≤2)
+      2. Artefact clipping (±5σ per channel)
+      3. Butterworth band-stack → (20, T) band-filtered amplitude time series
+      4. Per-channel z-score normalization (compensates for missing InvBase)
 
+    Returns (20, T) float32.
     Raises ValueError if too few quality samples remain.
     """
-    usecols = EEG_BAND_COLS.copy()
-    for col in ('HeadBandOn', 'HSI_TP9', 'HSI_AF7', 'HSI_AF8', 'HSI_TP10'):
-        usecols.append(col)
-
+    needed = RAW_EEG_COLS + ['HeadBandOn', 'HSI_TP9', 'HSI_AF7', 'HSI_AF8', 'HSI_TP10']
     try:
-        df = pd.read_csv(fp, usecols=lambda c: c in usecols)
+        df = pd.read_csv(fp, usecols=lambda c: c in needed)
     except Exception as e:
         raise ValueError(f'Cannot read {fp}: {e}')
 
@@ -153,12 +212,17 @@ def load_eeg_csv(fp: str, min_sec: float = 4.0, fs: float = 256.0) -> np.ndarray
             f'Only {len(df_q)} quality samples ({len(df_q)/fs:.1f}s) in {fp}, '
             f'need ≥{min_sec}s')
 
-    # ── extract band columns in fixed order ───────────────────────────────────
-    missing = [c for c in EEG_BAND_COLS if c not in df_q.columns]
+    # ── extract raw EEG in fixed channel order ────────────────────────────────
+    missing = [c for c in RAW_EEG_COLS if c not in df_q.columns]
     if missing:
-        raise ValueError(f'Missing EEG band columns in {fp}: {missing}')
+        raise ValueError(f'Missing raw EEG columns in {fp}: {missing}')
 
-    data = df_q[EEG_BAND_COLS].values.T.astype(np.float32)  # (20, T)
+    raw  = df_q[RAW_EEG_COLS].values.T.astype(np.float32)   # (4, T)
+
+    # ── process: clip → band-stack → z-score ─────────────────────────────────
+    raw  = _clip_artefacts(raw)        # (4, T) artefact-clipped
+    data = _band_stack(raw, fs=fs)     # (20, T) band-filtered amplitudes
+    data = _zscore_clip(data)          # (20, T) z-scored per channel
     return data
 
 
@@ -190,7 +254,7 @@ def extract_bvp_from_ppg_csv(fp: str) -> np.ndarray:
         return _ZERO_BVP.copy()
 
     ppg    = pd.to_numeric(df['ppg_green'], errors='coerce').fillna(0).values.astype(np.float64)
-    time_s = pd.to_numeric(df['time_s'],    errors='coerce').fillna(method='ffill').values.astype(np.float64)
+    time_s = pd.to_numeric(df['time_s'],    errors='coerce').ffill().values.astype(np.float64)
 
     if len(ppg) < 30:
         return _ZERO_BVP.copy()
