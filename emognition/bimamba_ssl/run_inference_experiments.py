@@ -566,9 +566,41 @@ def main():
 
     # ══════════════════════════════════════════════════════════════════════════
     #  E. Load all inference participant clips
-    # ══════════════════════════════════════════════════════════════════════════════
-    print('\n[E] Loading inference participant clips...')
-    all_clips              = load_all_participants(args.inference_dir)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Compute population-average baseline spectrum from training subjects.
+    # This is passed to load_all_participants so inference clips go through the
+    # EXACT same InvBase normalisation as the original training data:
+    #   clip → clip_artefacts → InvBase(pop_baseline) → band_stack
+    # Without this, inference clips have a different spectral distribution
+    # (raw 1/f slope vs InvBase-flattened training data) → model can't generalise.
+    print('\n[E] Computing population-average InvBase baseline...')
+    valid_spectra = [v for v in baselines.values()
+                     if v is not None and hasattr(v, 'shape') and v.ndim == 2]
+    if valid_spectra:
+        ref_len = valid_spectra[0].shape[1]
+        aligned = []
+        for sp in valid_spectra:
+            if sp.shape[1] == ref_len:
+                aligned.append(sp.astype(np.float64))
+            else:
+                # Interpolate to common frequency resolution
+                old_f = np.linspace(0.0, FS / 2.0, sp.shape[1])
+                new_f = np.linspace(0.0, FS / 2.0, ref_len)
+                new_sp = np.zeros((sp.shape[0], ref_len), dtype=np.float64)
+                for c in range(sp.shape[0]):
+                    new_sp[c] = np.interp(new_f, old_f, sp[c])
+                aligned.append(new_sp)
+        pop_baseline = np.stack(aligned).mean(axis=0).astype(np.float32)  # (4, ref_len)
+        print(f'    Population baseline: shape={pop_baseline.shape} '
+              f'from {len(aligned)} subjects')
+    else:
+        pop_baseline = None
+        print('    WARNING: No baselines found — inference clips will use '
+              'self-whitening fallback (poor approximation)')
+
+    print('\n[F] Loading inference participant clips...')
+    all_clips              = load_all_participants(args.inference_dir,
+                                                  baseline_spectrum=pop_baseline)
     lower_clips, upper_clips = split_clips(all_clips)
 
     # Summarise split

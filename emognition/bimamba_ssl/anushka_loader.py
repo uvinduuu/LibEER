@@ -7,9 +7,9 @@ Input file formats
 EEG CSV  :  {emotion}{clip_id}_{name}_eeg_cleaned.csv
   Columns: TimeStamp, Delta_TP9..Gamma_TP10 (20 band-ch), RAW_TP9..TP10,
            HeadBandOn, HSI_TP9..TP10, ...
-  → Reads RAW_TP9/AF7/AF8/TP10, applies artefact clipping + Butterworth
-    band-stack (matching training pipeline) + per-channel z-score
-    (compensates for missing InvBase normalization).
+  → Reads RAW_TP9/AF7/AF8/TP10, applies artefact clipping +
+    InvBase normalisation (using population-average resting baseline from
+    training subjects) + Butterworth band-stack. Matches training pipeline.
 
 PPG CSV  :  {emotion}{clip_id}_{name}_ppg_hr_ibi_cleaned.csv
   Columns: ppg_timestamp_ms, ppg_timestamp_readable, ppg_green, time_s
@@ -95,12 +95,65 @@ def _band_stack(trial: np.ndarray, fs: float = 256.0,
 def _zscore_clip(arr: np.ndarray) -> np.ndarray:
     """
     Per-channel z-score normalization over the full clip.
-    Compensates for the missing InvBase baseline normalization.
+    Used as a final step after spectral whitening + band-stack.
     """
     m = arr.mean(axis=1, keepdims=True)
     s = arr.std(axis=1, keepdims=True)
     s = np.where(s < 1e-8, 1.0, s)
     return ((arr - m) / s).astype(np.float32)
+
+
+def _invbase_whiten(trial: np.ndarray,
+                    baseline_power: np.ndarray = None,
+                    fs: float = 256.0) -> np.ndarray:
+    """
+    Apply InvBase spectral normalisation — mirrors apply_invbase_to_raw() in
+    invbase.py exactly.
+
+    Divides each FFT bin's amplitude by sqrt(baseline_power), so the output
+    represents deviations from the subject's (or population's) resting state.
+
+    baseline_power : (C, n_base) float — power spectrum of the resting baseline.
+        If None, falls back to using the clip's own power (poor approximation —
+        only use when no baseline is available at all).
+
+    Floor strategy: 1% of per-channel mean power (same as invbase.py), which
+    prevents catastrophic amplification in out-of-band bins.
+
+    Input:  (C, T)  artefact-clipped raw EEG
+    Output: (C, T)  InvBase-normalised EEG
+    """
+    C, T   = trial.shape
+    fft    = np.fft.rfft(trial.astype(np.float64), axis=1)  # (C, n_freq) complex
+    n_freq = fft.shape[1]
+
+    if baseline_power is not None:
+        # ── proper InvBase: use provided power spectrum (matches training) ──
+        n_base = baseline_power.shape[1]
+        if n_base == n_freq:
+            base = baseline_power.astype(np.float64).copy()
+        else:
+            # Interpolate baseline to clip's FFT frequency resolution
+            from scipy.interpolate import interp1d
+            old_freqs = np.linspace(0.0, fs / 2.0, n_base)
+            new_freqs = np.fft.rfftfreq(T, d=1.0 / fs)
+            base = np.zeros((C, n_freq), dtype=np.float64)
+            for c in range(C):
+                fi = interp1d(old_freqs, baseline_power[c].astype(np.float64),
+                              kind='linear', fill_value='extrapolate')
+                base[c] = fi(new_freqs)
+    else:
+        # ── fallback: clip's own power (no resting baseline available) ──
+        base = np.abs(fft) ** 2
+
+    # Per-channel floor = 1% of mean power (same as invbase.py)
+    mean_p    = base.mean(axis=1, keepdims=True)
+    floor     = np.maximum(mean_p * 0.01, 1e-10)
+    base_safe = np.maximum(base, floor)
+
+    fft_norm = fft / np.sqrt(base_safe)
+    result   = np.fft.irfft(fft_norm, n=T, axis=1)
+    return result.astype(np.float32)
 
 
 # ── EEG band column order kept for reference (not used for loading any more) ─
@@ -179,18 +232,33 @@ def parse_clip_info(filename: str):
 #  EEG CSV loading
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_eeg_csv(fp: str, min_sec: float = 4.0, fs: float = 256.0) -> np.ndarray:
+def load_eeg_csv(fp: str, min_sec: float = 4.0, fs: float = 256.0,
+                 baseline_spectrum: np.ndarray = None) -> np.ndarray:
     """
     Load and process raw EEG from a CSV file into the model's expected format.
 
-    Pipeline (matches training):
+    Pipeline (matches training exactly when baseline_spectrum is provided):
       1. Read RAW_TP9/AF7/AF8/TP10 with quality mask (HeadBandOn==1, HSI≤2)
-      2. Artefact clipping (±5σ per channel)
-      3. Butterworth band-stack → (20, T) band-filtered amplitude time series
-      4. Per-channel z-score normalization (compensates for missing InvBase)
+      2. Fill NaN/Inf in raw EEG (signal dropouts, connection glitches)
+      3. Artefact clipping (±5σ per channel)
+      4. InvBase normalisation — divides FFT amplitudes by sqrt(baseline_power)
+           • baseline_spectrum provided (recommended): population-average resting
+             baseline from training subjects → exact match to training pipeline
+           • baseline_spectrum=None (fallback): uses clip's own power spectrum
+             (poor approximation, only when no baseline is available)
+      5. Butterworth band-stack → (20, T) band-filtered amplitude time series
+      6. Per-channel z-score (only applied when baseline_spectrum=None)
+
+    Args:
+        fp:                 path to *_eeg_cleaned.csv
+        min_sec:            minimum duration after quality masking
+        fs:                 sampling rate in Hz (default: 256)
+        baseline_spectrum:  (4, n_freq) power spectrum of resting baseline.
+                            Pass the population-average spectrum from training
+                            subjects for distribution-matched inference.
 
     Returns (20, T) float32.
-    Raises ValueError if too few quality samples remain.
+    Raises ValueError if too few quality samples remain or output contains NaN.
     """
     needed = RAW_EEG_COLS + ['HeadBandOn', 'HSI_TP9', 'HSI_AF7', 'HSI_AF8', 'HSI_TP10']
     try:
@@ -217,12 +285,22 @@ def load_eeg_csv(fp: str, min_sec: float = 4.0, fs: float = 256.0) -> np.ndarray
     if missing:
         raise ValueError(f'Missing raw EEG columns in {fp}: {missing}')
 
-    raw  = df_q[RAW_EEG_COLS].values.T.astype(np.float32)   # (4, T)
+    # Fill NaN/Inf in raw EEG (signal dropouts, connection glitches)
+    raw_df = df_q[RAW_EEG_COLS].ffill().bfill().fillna(0.0)
+    raw    = raw_df.values.T.astype(np.float32)              # (4, T)
+    n_qual = int(mask.sum())
 
-    # ── process: clip → band-stack → z-score ─────────────────────────────────
-    raw  = _clip_artefacts(raw)        # (4, T) artefact-clipped
-    data = _band_stack(raw, fs=fs)     # (20, T) band-filtered amplitudes
-    data = _zscore_clip(data)          # (20, T) z-scored per channel
+    # ── process: clip → InvBase → band-stack (→ z-score if no baseline) ──────
+    raw  = _clip_artefacts(raw)                          # (4, T) artefact-clipped
+    raw  = _invbase_whiten(raw, baseline_spectrum, fs)   # (4, T) InvBase-normalised
+    data = _band_stack(raw, fs=fs)                       # (20, T) band-filtered
+    if baseline_spectrum is None:
+        data = _zscore_clip(data)                        # fallback z-score only
+
+    if not np.isfinite(data).all():
+        raise ValueError(
+            f'NaN/Inf in processed EEG from {os.path.basename(fp)} '
+            f'({n_qual} quality samples)')
     return data
 
 
@@ -333,7 +411,8 @@ def _parse_pid(folder_name: str) -> int:
 
 
 def load_participant_clips(data_dir: str, min_sec: float = 4.0,
-                           folder_name: str = '') -> list:
+                           folder_name: str = '',
+                           baseline_spectrum: np.ndarray = None) -> list:
     """
     Scan data_dir for *_eeg_cleaned.csv files and load all clips.
 
@@ -371,7 +450,7 @@ def load_participant_clips(data_dir: str, min_sec: float = 4.0,
 
         # Load EEG
         try:
-            eeg = load_eeg_csv(fp, min_sec=min_sec)
+            eeg = load_eeg_csv(fp, min_sec=min_sec, baseline_spectrum=baseline_spectrum)
         except ValueError as e:
             print(f'    [skip] {e}')
             n_skip += 1
@@ -399,7 +478,8 @@ def load_participant_clips(data_dir: str, min_sec: float = 4.0,
     return clips
 
 
-def load_all_participants(root_dir: str, min_sec: float = 4.0) -> list:
+def load_all_participants(root_dir: str, min_sec: float = 4.0,
+                          baseline_spectrum: np.ndarray = None) -> list:
     """
     Load clips from ALL participant subdirectories under root_dir.
 
@@ -408,6 +488,12 @@ def load_all_participants(root_dir: str, min_sec: float = 4.0) -> list:
             Participant 1/  ...eeg_cleaned.csv ...
             Participant 2/  ...
             ...
+
+    Args:
+        baseline_spectrum: (4, n_freq) population-average resting power spectrum
+            from training subjects.  Pass this to apply exact InvBase normalisation
+            so inference data matches the training distribution.  If None, falls
+            back to clip-self-whitening (poor approximation).
 
     Returns: list of ClipRecord across all participants,
              sorted by (pid, emotion, clip_idx).
@@ -429,7 +515,8 @@ def load_all_participants(root_dir: str, min_sec: float = 4.0) -> list:
         # Fall back: treat root_dir itself as a single participant folder
         print(f'  No Participant N subdirs found — treating root as single folder')
         return load_participant_clips(root_dir, min_sec=min_sec,
-                                     folder_name=os.path.basename(root_dir))
+                                     folder_name=os.path.basename(root_dir),
+                                     baseline_spectrum=baseline_spectrum)
 
     print(f'  Found {len(subdirs)} participant folder(s): {subdirs}')
     all_clips = []
@@ -443,7 +530,8 @@ def load_all_participants(root_dir: str, min_sec: float = 4.0) -> list:
             print(f'  [{folder}] no EEG CSVs — skipping')
             continue
         print(f'\n  [{folder}]  ({eeg_count} EEG file(s))')
-        clips = load_participant_clips(path, min_sec=min_sec, folder_name=folder)
+        clips = load_participant_clips(path, min_sec=min_sec, folder_name=folder,
+                                      baseline_spectrum=baseline_spectrum)
         all_clips.extend(clips)
         print(f'    → {len(clips)} clips loaded')
 
