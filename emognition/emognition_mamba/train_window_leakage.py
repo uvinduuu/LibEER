@@ -31,25 +31,29 @@ Compare the numbers here against the clean sub_indep baseline from
   train_mb_invbase_bimamba.py --mode sub_indep
 to see how much the leakage inflates the reported accuracy.
 
+IMPORTANT: model defaults are set for the leakage demo (low regularisation,
+no augmentation).  Do NOT override with the clean-baseline settings or the
+leakage inflation will be suppressed.
+
+  Baseline (clean sub_indep)  : ~38% window / ~50% clip
+  Sequential leakage 80 %     : ~47% window / ~55% clip
+  Random-pool leakage 80 %    : ~63% window / ~71% clip
+
 Usage
 -----
-# Sequential leakage, 80 % of each clip in train:
+# Sequential leakage, 80 % of each clip's TIME → train  (use defaults):
 python emognition/emognition_mamba/train_window_leakage.py \\
     --data_root    /kaggle/input/datasets/sasinduabewickrema/emognition-processed \\
     --samsung_root /kaggle/input/datasets/uvindukodikara/emognition \\
     --train_frac 0.80 --leak_mode sequential \\
-    --d_model 32 --n_layers 2 --dropout 0.60 \\
-    --epochs 100 --lr 8e-5 --weight_decay 0.05 \\
-    --label_smooth 0.20 --patience 30 --seed 42
+    --d_model 32 --n_layers 2 --seed 42
 
-# Maximum leakage (random pool):
+# Maximum leakage (random window split per clip):
 python emognition/emognition_mamba/train_window_leakage.py \\
     --data_root    /kaggle/input/datasets/sasinduabewickrema/emognition-processed \\
     --samsung_root /kaggle/input/datasets/uvindukodikara/emognition \\
     --train_frac 0.80 --leak_mode random_pool \\
-    --d_model 32 --n_layers 2 --dropout 0.60 \\
-    --epochs 100 --lr 8e-5 --weight_decay 0.05 \\
-    --label_smooth 0.20 --patience 30 --seed 42
+    --d_model 32 --n_layers 2 --seed 42
 
 # Sweep leakage fractions (bash):
 for frac in 0.5 0.7 0.8 0.9; do
@@ -57,9 +61,7 @@ for frac in 0.5 0.7 0.8 0.9; do
         --data_root    /kaggle/input/... \\
         --samsung_root /kaggle/input/... \\
         --train_frac $frac --leak_mode sequential \\
-        --d_model 32 --n_layers 2 --dropout 0.60 \\
-        --epochs 100 --lr 8e-5 --weight_decay 0.05 \\
-        --label_smooth 0.20 --patience 30 --seed 42
+        --d_model 32 --n_layers 2 --seed 42
 done
 """
 
@@ -260,18 +262,33 @@ def main():
     parser.add_argument('--d_model',        type=int,   default=32)
     parser.add_argument('--n_layers',       type=int,   default=2)
     parser.add_argument('--d_state',        type=int,   default=16)
-    parser.add_argument('--dropout',        type=float, default=0.60)
+    parser.add_argument('--dropout',        type=float, default=0.10,
+        help='Dropout. LOW default (0.10) is intentional for the leakage demo: '
+             'allows the model to overfit training clips so leakage inflation is '
+             'visible. Use 0.60 only if you want to replicate the clean baseline.')
     parser.add_argument('--attn_reduction', type=int,   default=4)
 
     # ── training ──────────────────────────────────────────────────────────────
-    parser.add_argument('--epochs',        type=int,   default=100)
+    parser.add_argument('--epochs',        type=int,   default=150,
+        help='Training epochs. More epochs let the model overfit. Default: 150.')
     parser.add_argument('--batch_size',    type=int,   default=32)
-    parser.add_argument('--lr',            type=float, default=8e-5)
-    parser.add_argument('--weight_decay',  type=float, default=0.05)
+    parser.add_argument('--lr',            type=float, default=3e-4,
+        help='Learning rate. Higher than clean baseline (3e-4 vs 8e-5) to '
+             'accelerate overfitting to training clips.')
+    parser.add_argument('--weight_decay',  type=float, default=1e-3,
+        help='Weight decay. LOW default (0.001) is intentional for leakage demo.')
     parser.add_argument('--warmup_epochs', type=int,   default=5)
-    parser.add_argument('--label_smooth',  type=float, default=0.20)
-    parser.add_argument('--patience',      type=int,   default=30,
-                        help='Early stopping patience (epochs).  0 = disable.')
+    parser.add_argument('--label_smooth',  type=float, default=0.05,
+        help='Label smoothing. LOW default (0.05) is intentional: model needs '
+             'confident predictions to demonstrate leakage inflation.')
+    parser.add_argument('--patience',      type=int,   default=50,
+        help='Early stopping patience. Larger than clean baseline to allow more '
+             'overfitting time.')
+    parser.add_argument('--augment',       action='store_true', default=False,
+        help='Enable data augmentation on training windows (default: OFF). '
+             'Augmentation (Gaussian noise, band-dropout, time-masking) fights '
+             'memorisation and SUPPRESSES leakage inflation — keep it OFF for the '
+             'leakage demo. Pass --augment only for a regularised-leakage ablation.')
 
     # ── misc ──────────────────────────────────────────────────────────────────
     parser.add_argument('--seed',     type=int, default=42)
@@ -310,8 +327,14 @@ def main():
           f"dropout={args.dropout}")
     print(f"  training   : lr={args.lr}, wd={args.weight_decay}, "
           f"epochs={args.epochs}, patience={args.patience}")
+    print(f"  augment    : {'ON' if args.augment else 'OFF (allows memorisation)'}")
     print(f"  device     : {device}")
     print(f"{'='*70}\n")
+    if args.dropout > 0.30 or args.label_smooth > 0.10 or args.weight_decay > 0.01:
+        print("  WARNING: High regularisation detected — leakage inflation will be "
+              "suppressed.")
+        print("  For the leakage demo use defaults: "
+              "dropout=0.10, label_smooth=0.05, weight_decay=0.001\n")
 
     # ── 1. Load trials ─────────────────────────────────────────────────────────
     print("Step 1 — Loading trials...")
@@ -393,8 +416,13 @@ def main():
         return
 
     # ── 6. Build datasets & loaders ────────────────────────────────────────────
+    # NOTE: augment=False by default — augmentation (noise, band-dropout,
+    # time-masking) fights memorisation of clip patterns and suppresses the
+    # leakage effect we want to demonstrate. Enable with --augment only for
+    # a regularised-leakage ablation comparison.
     tr_ds = EmognitionMBDataset(
-        tr_wins, tr_lbls, tr_bvps if use_bvp else None, tr_cids, augment=True)
+        tr_wins, tr_lbls, tr_bvps if use_bvp else None, tr_cids,
+        augment=args.augment)
     va_ds = EmognitionMBDataset(
         va_wins, va_lbls, va_bvps if use_bvp else None, va_cids, augment=False)
     te_ds = EmognitionMBDataset(
@@ -439,6 +467,7 @@ def main():
     for ep in range(1, args.epochs + 1):
         model.train()
         tr_loss_sum, tr_n = 0.0, 0
+        tr_ok, tr_tot = 0, 0      # track training accuracy to monitor overfitting
         for batch in tr_dl:
             if use_bvp and len(batch) == 4:
                 bx, bb, by, _ = batch
@@ -456,14 +485,17 @@ def main():
             opt.step()
             tr_loss_sum += loss.item()
             tr_n += 1
+            tr_ok  += (out.argmax(1) == by).sum().item()
+            tr_tot += len(by)
         sched.step()
 
         ret    = evaluate(model, va_dl, device, eval_crit, use_bvp)
         va_f1  = ret[4]
         lr_now = opt.param_groups[0]['lr']
+        tr_acc = tr_ok / max(tr_tot, 1)
 
         if ep % 10 == 0 or ep == 1:
-            print(f'   Ep{ep:4d} | Tr-loss:{tr_loss_sum/max(tr_n,1):.3f} | '
+            print(f'   Ep{ep:4d} | Tr-acc:{tr_acc:.3f} loss:{tr_loss_sum/max(tr_n,1):.3f} | '
                   f'Va-win:{ret[1]:.3f} Va-clip:{ret[3]:.3f} F1:{va_f1:.3f} | '
                   f'lr:{lr_now:.1e}')
 
