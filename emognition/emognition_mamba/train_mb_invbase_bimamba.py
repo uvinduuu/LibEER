@@ -55,7 +55,8 @@ sys.path.insert(0, _EMOG_DIR)
 from emognition_processed_loader import load_emognition_processed
 from invbase import (load_baselines_processed, apply_invbase_to_raw,
                      INVBASE_BAND_HZ, NUM_BANDS)
-from mb_invbase_bimamba_model import MBInvBaseBiMamba, IN_CHANNELS
+from mb_invbase_bimamba_model import (MBInvBaseBiMamba, IN_CHANNELS,
+                                      BVPEncoder, FiLMLayer, IBI_MAX_BEATS)
 
 # scipy is used only during data preprocessing (not in the training loop)
 from scipy.signal import butter, filtfilt
@@ -456,8 +457,13 @@ def window_trials(processed_trials, labels, subject_ids,
 #  BVP / Samsung Watch Feature Extraction
 # ════════════════════════════════════════════════════════════════════════════
 
-BVP_DIM      = 8                    # [HR_mean, RMSSD, pNN50, IBI_range,
-                                    #  SDNN, mean_IBI, LF_proxy, HF_proxy]
+# BVP feature layout (stored as a single vector per clip):
+#   First BVP_HAND_DIM dims : handcrafted HRV features (global z-score in training loop)
+#   Last  IBI_MAX_BEATS dims : per-clip z-scored IBI series (already normalised)
+BVP_HAND_DIM = 11                   # HR_mean, RMSSD, pNN50, pNN20,
+                                    # IBI_range, SDNN, mean_IBI,
+                                    # LF_power, HF_power, LF_HF_ratio, IBI_cv
+BVP_DIM      = BVP_HAND_DIM + IBI_MAX_BEATS   # 11 + 64 = 75
 TARGET_EMOT  = {'ENTHUSIASM', 'FEAR', 'NEUTRAL', 'SADNESS'}
 
 
@@ -497,13 +503,39 @@ def _lf_hf_proxy(ibi: np.ndarray, fs_ibi: float = 4.0):
 
 def load_bvp_features_one(fp):
     """
-    Extract 8 HRV features from one Samsung Watch STIMULUS JSON.
+    Extract a 75-dim BVP feature vector from one Samsung Watch STIMULUS JSON.
 
-    Features:
-        [HR_mean, RMSSD, pNN50, IBI_range,
-         SDNN, mean_IBI, LF_proxy, HF_proxy]
+    Layout: [handcrafted(11) | ibi_series_zscored(64)]
 
-    Returns float32 array (8,) or None.
+    Handcrafted HRV features (11, indices 0-10):
+      Time-domain (7):
+        0  HR_mean     — mean heart rate in BPM
+        1  RMSSD       — root-mean-square successive RR differences (vagal tone)
+        2  pNN50       — fraction of RR diffs > 50 ms (parasympathetic index)
+        3  pNN20       — fraction of RR diffs > 20 ms (more sensitive short-term HRV)
+        4  IBI_range   — max − min IBI (overall beat-interval spread)
+        5  SDNN        — std-dev of all RR intervals (global HRV)
+        6  mean_IBI    — mean RR interval (inversely proportional to HR)
+      Frequency-domain (3):
+        7  LF_power    — 0.04–0.15 Hz band (sympathovagal balance)
+        8  HF_power    — 0.15–0.40 Hz band (vagal/respiratory)
+        9  LF_HF_ratio — LF/HF ratio (autonomic balance; elevated under stress)
+      Normalised (1):
+        10 IBI_cv      — SDNN / mean_IBI (HR-normalised HRV, coefficient of variation)
+
+    IBI series (64, indices 11-74):
+        Per-clip z-scored IBI values, padded/truncated to IBI_MAX_BEATS (64).
+        Per-clip normalisation: (ibi - ibi.mean()) / (ibi.std() + eps)
+        Zero-padding for clips shorter than 64 beats.
+        The CNN learns temporal dynamics (deceleration shape, RSA oscillations)
+        that scalar HRV statistics compress away.
+
+    Note on double-normalisation:
+        The training loop applies global z-score to all BVP_DIM=75 dimensions.
+        The IBI series is already per-clip z-scored (mean≈0, std≈1 across clips),
+        so the global z-score is approximately identity for those 64 dims — safe.
+
+    Returns float32 array (75,) or None if IBI data is insufficient.
     """
     try:
         with open(fp) as f:
@@ -511,30 +543,48 @@ def load_bvp_features_one(fp):
     except Exception:
         return None
 
-    ibi = _parse_paired(obj.get('PPInterval'))
-    hr  = _parse_paired(obj.get('heartRate'))
+    ibi_raw = _parse_paired(obj.get('PPInterval'))
+    hr      = _parse_paired(obj.get('heartRate'))
 
-    if ibi is not None:
-        ibi = ibi[(ibi > 300) & (ibi < 2000) & np.isfinite(ibi)]
+    if ibi_raw is not None:
+        ibi_raw = ibi_raw[(ibi_raw > 300) & (ibi_raw < 2000) & np.isfinite(ibi_raw)]
     if hr is not None:
-        hr  = hr[(hr > 30)   & (hr  < 220)  & np.isfinite(hr)]
+        hr = hr[(hr > 30) & (hr < 220) & np.isfinite(hr)]
 
-    if ibi is None or len(ibi) < 5:
+    if ibi_raw is None or len(ibi_raw) < 5:
         return None
 
+    ibi       = ibi_raw
     diff_ibi  = np.diff(ibi)
-    hr_mean   = float(np.mean(hr))   if (hr is not None and len(hr) >= 3) \
-                else float(np.mean(60000.0 / ibi))
-    rmssd     = float(np.sqrt(np.mean(diff_ibi ** 2)))
-    pnn50     = float(np.mean(np.abs(diff_ibi) > 50))
-    ibi_range = float(ibi.max() - ibi.min())
-    sdnn      = float(ibi.std())
-    mean_ibi  = float(ibi.mean())
-    lf, hf    = _lf_hf_proxy(ibi)
+    hr_mean   = (float(np.mean(hr)) if (hr is not None and len(hr) >= 3)
+                 else float(np.mean(60000.0 / ibi)))
+    rmssd       = float(np.sqrt(np.mean(diff_ibi ** 2)))
+    pnn50       = float(np.mean(np.abs(diff_ibi) > 50))
+    pnn20       = float(np.mean(np.abs(diff_ibi) > 20))
+    ibi_range   = float(ibi.max() - ibi.min())
+    sdnn        = float(ibi.std())
+    mean_ibi    = float(ibi.mean())
+    lf, hf      = _lf_hf_proxy(ibi)
+    lf_hf_ratio = float(lf / (hf + 1e-8))
+    ibi_cv      = float(sdnn / (mean_ibi + 1e-8))
 
-    feat = np.array([hr_mean, rmssd, pnn50, ibi_range, sdnn, mean_ibi, lf, hf],
-                    dtype=np.float32)
-    return feat if np.all(np.isfinite(feat)) else None
+    hand = np.array(
+        [hr_mean, rmssd, pnn50, pnn20, ibi_range, sdnn, mean_ibi,
+         lf, hf, lf_hf_ratio, ibi_cv],
+        dtype=np.float32)
+    if not np.all(np.isfinite(hand)):
+        return None
+
+    # ── per-clip z-score the IBI series and pad/truncate to IBI_MAX_BEATS ──
+    ibi_f   = ibi.astype(np.float32)
+    ibi_mu  = ibi_f.mean()
+    ibi_sig = ibi_f.std() + 1e-8
+    ibi_z   = (ibi_f - ibi_mu) / ibi_sig          # z-scored IBI series
+    ibi_pad = np.zeros(IBI_MAX_BEATS, dtype=np.float32)
+    n       = min(len(ibi_z), IBI_MAX_BEATS)
+    ibi_pad[:n] = ibi_z[:n]                        # truncate or zero-pad
+
+    return np.concatenate([hand, ibi_pad])         # (75,)
 
 
 def build_bvp_lookup(samsung_root):
@@ -576,40 +626,71 @@ def build_bvp_lookup(samsung_root):
 
 class MultimodalMBModel(nn.Module):
     """
-    Wraps MBInvBaseBiMamba and concatenates BVP features before
-    the final classification head.
+    FiLM-conditioned multimodal EEG + BVP emotion classifier.
 
-    EEG embedding (d_model) → concat [HR_mean, RMSSD, pNN50, IBI_range]
-    → LayerNorm → Dropout(0.5) → Linear(d_model+4 → 32) → ELU
-    → Dropout(0.3) → Linear(32 → n_classes)
+    Architecture
+    ────────────
+    EEG path:
+        (B, 20, T) → MBInvBaseBiMamba backbone → eeg_emb (B, d_model)
+
+    BVP path (hybrid encoder):
+        x_bvp[:, :11]  — handcrafted HRV → Linear(11→d_model) → GELU
+        x_bvp[:, 11:]  — IBI series      → 2-layer 1D CNN → AdaptiveAvgPool
+        Concat → Linear(2*d_model → d_model) → LayerNorm → GELU → Dropout
+        → bvp_emb (B, d_model)
+
+    FiLM conditioning:
+        γ = Linear(d_model → d_model) initialised near 1
+        β = Linear(d_model → d_model) initialised near 0
+        modulated = LayerNorm(γ(bvp_emb) ⊙ eeg_emb + β(bvp_emb))
+
+    MLP head:
+        modulated → Dropout → Linear(d_model→d_model) → GELU
+                 → Dropout → Linear(d_model→n_classes) → logits
+
+    Fallback (--no_bvp):
+        eeg_emb passed directly to MLP head without any FiLM modulation.
     """
     def __init__(self, backbone: MBInvBaseBiMamba, bvp_dim: int, n_classes: int,
                  dropout: float = 0.5):
         super().__init__()
         self.backbone = backbone
         self.bvp_dim  = bvp_dim
-        d_emb         = backbone.d_model         # embedding dimension
+        d_model       = backbone.d_model
 
-        # Remove backbone's original head; replace with multimodal one
-        in_dim = d_emb + bvp_dim
+        if bvp_dim > 0:
+            self.bvp_encoder = BVPEncoder(
+                hand_dim = BVP_HAND_DIM,
+                ibi_len  = IBI_MAX_BEATS,
+                d_bvp    = d_model,
+                dropout  = dropout * 0.4,
+            )
+            self.film = FiLMLayer(d_feat=d_model, d_cond=d_model)
+        else:
+            self.bvp_encoder = None
+            self.film        = None
+
+        # MLP head: non-linear decision boundary after FiLM modulation
         self.head = nn.Sequential(
-            nn.LayerNorm(in_dim),
             nn.Dropout(dropout),
-            nn.Linear(in_dim, 32),
-            nn.ELU(),
-            nn.Dropout(dropout * 0.6),
-            nn.Linear(32, n_classes),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(d_model, n_classes),
         )
 
     def forward(self, x_eeg, x_bvp=None):
         """
         x_eeg : (B, 20, T)
-        x_bvp : (B, 4)  or None
+        x_bvp : (B, BVP_DIM=75) or None — [handcrafted(11) | ibi_series(64)]
         """
-        emb = self.backbone.get_embedding(x_eeg)   # (B, d_model)
-        if self.bvp_dim > 0 and x_bvp is not None:
-            emb = torch.cat([emb, x_bvp], dim=-1)  # (B, d_model+4)
-        return self.head(emb)
+        eeg_emb = self.backbone.get_embedding(x_eeg)          # (B, d_model)
+        if self.bvp_encoder is not None and x_bvp is not None:
+            hand    = x_bvp[:, :BVP_HAND_DIM]                 # (B, 11)
+            ibi     = x_bvp[:, BVP_HAND_DIM:]                 # (B, 64)
+            bvp_emb = self.bvp_encoder(hand, ibi)             # (B, d_model)
+            eeg_emb = self.film(eeg_emb, bvp_emb)             # (B, d_model)
+        return self.head(eeg_emb)
 
 
 # ════════════════════════════════════════════════════════════════════════════

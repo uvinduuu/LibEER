@@ -374,6 +374,139 @@ class MBInvBaseBiMamba(nn.Module):
         return self.head(self._encode(x, lengths))    # (B, num_classes)
 
 
+# ── BVP Encoder ──────────────────────────────────────────────────────────────
+
+IBI_MAX_BEATS = 64   # IBI series padded/truncated to this length (~60 s at 70 BPM)
+
+
+class BVPEncoder(nn.Module):
+    """
+    Hybrid BVP encoder: two parallel branches fused into a single d_bvp embedding.
+
+    Branch A — 1D CNN on the padded IBI series
+        Learns temporal dynamics of the heartbeat sequence that scalar statistics
+        cannot capture: e.g., HR deceleration shape at stimulus onset, oscillatory
+        RSA patterns, beat-to-beat acceleration during fear.
+        Input: (B, 1, IBI_MAX_BEATS)  Output: (B, d_bvp)
+
+    Branch B — Linear projection of handcrafted HRV features
+        Clinically validated indices (RMSSD, pNN50, LF/HF ratio …) that are
+        robust and interpretable even with N=41 subjects.
+        Input: (B, hand_dim)  Output: (B, d_bvp)
+
+    Fusion: concat → Linear(2*d_bvp → d_bvp) → LayerNorm → GELU → Dropout
+
+    Args:
+        hand_dim : number of handcrafted HRV features  (default: 11)
+        ibi_len  : padded IBI sequence length           (default: IBI_MAX_BEATS=64)
+        d_bvp    : output embedding dimension           (default: 32)
+        dropout  : dropout after fusion                 (default: 0.2)
+    """
+
+    def __init__(self, hand_dim: int = 11, ibi_len: int = IBI_MAX_BEATS,
+                 d_bvp: int = 32, dropout: float = 0.2):
+        super().__init__()
+
+        # ── Branch A: CNN on IBI series ───────────────────────────────────────
+        self.cnn = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=3, padding=1),
+            nn.BatchNorm1d(16),
+            nn.GELU(),
+            nn.Conv1d(16, d_bvp, kernel_size=3, padding=1),
+            nn.BatchNorm1d(d_bvp),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),   # (B, d_bvp, 1) → squeeze
+        )
+
+        # ── Branch B: handcrafted projection ─────────────────────────────────
+        self.hand_proj = nn.Sequential(
+            nn.Linear(hand_dim, d_bvp),
+            nn.GELU(),
+        )
+
+        # ── Fusion ────────────────────────────────────────────────────────────
+        self.fusion = nn.Sequential(
+            nn.Linear(d_bvp * 2, d_bvp),
+            nn.LayerNorm(d_bvp),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, hand: torch.Tensor, ibi: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hand : (B, hand_dim) — z-scored handcrafted HRV features
+            ibi  : (B, ibi_len)  — per-clip z-scored padded IBI series
+        Returns:
+            (B, d_bvp) — hybrid BVP embedding
+        """
+        cnn_emb  = self.cnn(ibi.unsqueeze(1)).squeeze(-1)           # (B, d_bvp)
+        hand_emb = self.hand_proj(hand)                              # (B, d_bvp)
+        return self.fusion(torch.cat([cnn_emb, hand_emb], dim=-1))  # (B, d_bvp)
+
+
+# ── FiLM Conditioning ─────────────────────────────────────────────────────────
+
+class FiLMLayer(nn.Module):
+    """
+    Feature-wise Linear Modulation (Perez et al., AAAI 2018).
+
+    Conditions the EEG embedding on the BVP physiological state:
+
+        output = LayerNorm( γ(bvp) ⊙ eeg_emb + β(bvp) )
+
+    γ and β are per-dimension vectors produced by small linear layers from
+    the BVP embedding.  Each dimension of the EEG embedding gets its own
+    independent scale and shift — so the BVP state can amplify fear-related
+    beta/gamma dims and suppress relaxation-related alpha dims simultaneously.
+
+    Physiological motivation
+    ────────────────────────
+    The ANS (BVP/HRV) and CNS (EEG) are co-driven by the same affective state
+    through different pathways.  The same EEG feature pattern has different
+    emotional meaning depending on the concurrent autonomic state:
+      high HR + low HRV  → amplify fear/stress EEG dimensions
+      low HR  + high HRV → amplify relaxation/enthusiasm dimensions
+    FiLM encodes this interaction explicitly rather than leaving it to the
+    classifier to discover from a flat concatenated vector.
+
+    Initialisation (critical for training stability with N=41 subjects)
+    ───────────────────────────────────────────────────────────────────
+    γ bias ← 1.0, γ weight ← N(0, 0.01)  → γ ≈ 1 at start (identity scale)
+    β weight ← 0,  β bias ← 0             → β ≈ 0 at start (no shift)
+    Training starts as pure EEG classification.  FiLM modulation grows only
+    as sufficient gradient evidence from BVP accumulates.
+
+    Args:
+        d_feat : EEG embedding dimension to modulate (= backbone d_model)
+        d_cond : BVP conditioning vector dimension   (= BVPEncoder d_bvp)
+    """
+
+    def __init__(self, d_feat: int, d_cond: int):
+        super().__init__()
+        self.gamma_proj = nn.Linear(d_cond, d_feat)
+        self.beta_proj  = nn.Linear(d_cond, d_feat)
+        self.norm       = nn.LayerNorm(d_feat)
+
+        # Stable init: γ ≈ 1 (identity scale), β ≈ 0 (no shift)
+        nn.init.normal_(self.gamma_proj.weight, mean=0.0, std=0.01)
+        nn.init.ones_(self.gamma_proj.bias)
+        nn.init.zeros_(self.beta_proj.weight)
+        nn.init.zeros_(self.beta_proj.bias)
+
+    def forward(self, eeg_emb: torch.Tensor, bvp_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            eeg_emb : (B, d_feat) — EEG backbone embedding
+            bvp_emb : (B, d_cond) — BVP conditioning vector
+        Returns:
+            (B, d_feat) — FiLM-modulated, LayerNorm-stabilised EEG embedding
+        """
+        gamma = self.gamma_proj(bvp_emb)            # (B, d_feat)
+        beta  = self.beta_proj(bvp_emb)             # (B, d_feat)
+        return self.norm(gamma * eeg_emb + beta)    # (B, d_feat)
+
+
 # ── quick sanity check ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":

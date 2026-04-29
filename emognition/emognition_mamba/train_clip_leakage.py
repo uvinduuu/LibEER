@@ -1,68 +1,44 @@
 #!/usr/bin/env python3
 """
-train_window_leakage.py
-=======================
-Window-leakage ablation experiment for MB-InvBase-BiMamba.
+train_clip_leakage.py
+=====================
+Clip-leakage ablation experiment for MB-InvBase-BiMamba.
 
-Many EEG papers accidentally inflate accuracy by windowing recordings first
-and then splitting windows randomly — so windows from the SAME clip appear in
-both train and test.  This script reproduces that scenario deliberately so you
-can quantify the inflation vs the clean subject-independent split.
+Leakage Hierarchy (three scripts, three levels)
+------------------------------------------------
+1. Clean sub_indep  (train_mb_invbase_bimamba.py)
+   Split at the SUBJECT level.  A subject's clips only ever appear in ONE
+   of train / val / test.  No subject-identity or temporal leakage.
 
-Two leakage modes
------------------
-sequential   First train_frac of EACH CLIP'S TIME → training windows (50 %
-             overlap).  Last (1-train_frac) → test windows (non-overlapping).
-             Leakage source: (a) filtfilt / InvBase preprocessing uses the
-             full recording, (b) temporal proximity means train and test windows
-             come from the same emotion episode.
+2. Clip leakage  ← THIS SCRIPT
+   Split at the WINDOW level, but windows are kept non-overlapping so no raw
+   samples are shared.  For each clip (trial), its non-overlapping windows are
+   RANDOMLY ASSIGNED to train / val / test pools.
+   Leakage source: the same clip's temporal context appears in all three splits.
+   The model implicitly sees the recording it will be tested on.
 
-random_pool  All clips windowed (50 % overlap), pooled, and RANDOMLY split by
-             window count.  This is the classic paper mistake: neighboring
-             overlapping windows may end up in different splits simultaneously.
-             Gives the maximum possible inflation.
+3. Window leakage  (train_window_leakage.py --overlap_frac 0.70)
+   70 % overlapping windows are randomly split.  Adjacent windows share 70 %
+   of their raw samples → near-duplicate data in train and test.
 
-Tunable leakage
----------------
---train_frac  controls how much of each clip feeds training
-              0.5 → moderate leakage   0.8 → high leakage   0.9 → very high
+Why clip leakage inflates accuracy
+-----------------------------------
+The model is tested on windows from the same recording session it trained on.
+  - Same subject → no subject-generalisation required.
+  - Same emotional episode → the model can partly memorise the EEG pattern of
+    that specific clip rather than learning general features.
+  - BVP features are identical across all windows of a clip, reinforcing the
+    memorisation pathway.
 
-Compare the numbers here against the clean sub_indep baseline from
-  train_mb_invbase_bimamba.py --mode sub_indep
-to see how much the leakage inflates the reported accuracy.
-
-IMPORTANT: model defaults are set for the leakage demo (low regularisation,
-no augmentation).  Do NOT override with the clean-baseline settings or the
-leakage inflation will be suppressed.
-
-  Baseline (clean sub_indep)  : ~38% window / ~50% clip
-  Sequential leakage 80 %     : ~47% window / ~55% clip
-  Random-pool leakage 80 %    : ~63% window / ~71% clip
+Expected results vs clean baseline (~38% window / ~50% clip):
+  Clip leakage  ≈ 55-65% window / 65-75% clip
 
 Usage
 -----
-# Sequential leakage, 80 % of each clip's TIME → train  (use defaults):
-python emognition/emognition_mamba/train_window_leakage.py \\
+python emognition/emognition_mamba/train_clip_leakage.py \\
     --data_root    /kaggle/input/datasets/sasinduabewickrema/emognition-processed \\
     --samsung_root /kaggle/input/datasets/uvindukodikara/emognition \\
-    --train_frac 0.80 --leak_mode sequential \\
-    --d_model 32 --n_layers 2 --seed 42
-
-# Maximum leakage (random window split per clip):
-python emognition/emognition_mamba/train_window_leakage.py \\
-    --data_root    /kaggle/input/datasets/sasinduabewickrema/emognition-processed \\
-    --samsung_root /kaggle/input/datasets/uvindukodikara/emognition \\
-    --train_frac 0.80 --leak_mode random_pool \\
-    --d_model 32 --n_layers 2 --seed 42
-
-# Sweep leakage fractions (bash):
-for frac in 0.5 0.7 0.8 0.9; do
-    python emognition/emognition_mamba/train_window_leakage.py \\
-        --data_root    /kaggle/input/... \\
-        --samsung_root /kaggle/input/... \\
-        --train_frac $frac --leak_mode sequential \\
-        --d_model 32 --n_layers 2 --seed 42
-done
+    --train_frac 0.70 --d_model 32 --n_layers 2 --seed 42
 """
 
 import os
@@ -89,131 +65,100 @@ from train_mb_invbase_bimamba    import (
     MultimodalMBModel, EmognitionMBDataset,
     WarmupCosineScheduler, LabelSmoothingCE,
     evaluate, build_bvp_lookup, process_trial,
+    load_baselines_raw,
     BVP_DIM, NUM_CLASSES, CLASS_NAMES, FS,
     setup_seed, print_report,
 )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Window-leakage data split
+#  Clip-leakage data split
 # ══════════════════════════════════════════════════════════════════════════════
 
-def make_leakage_split(
+def make_clip_leakage_split(
         processed_trials,
         labels,
         bvp_feats,
         window_size: int,
-        step_train:  int,
-        step_test:   int,
-        train_frac:  float = 0.80,
+        train_frac:  float = 0.70,
         val_frac:    float = 0.15,
-        leak_mode:   str   = 'sequential',
         seed:        int   = 42,
 ):
     """
-    Build train / val / test window sets with intentional cross-clip leakage.
+    Clip-leakage split: each clip's NON-OVERLAPPING windows are randomly
+    assigned to train / val / test pools.
+
+    Leakage mechanism:
+      - No subject-level separation: the same subject's clips feed all splits.
+      - No window duplication: each window appears in exactly ONE split.
+      - But the same clip's temporal context appears in MULTIPLE splits, so
+        the model is trained and evaluated on different moments of the very
+        same emotional recording session.
 
     Parameters
     ----------
     processed_trials : list of (20, T) float32 arrays
-    labels           : list of int  (one per trial)
+    labels           : list of int  (one per trial / clip)
     bvp_feats        : list of (BVP_DIM,) float32 arrays (one per trial)
-    window_size      : number of samples per window
-    step_train       : window step for training side (use overlap, e.g. window//2)
-    step_test        : window step for test side (non-overlapping = window_size)
-    train_frac       : fraction of each clip assigned to the training pool
-                         sequential  → fraction of TIME
-                         random_pool → fraction of WINDOWS per clip
-    val_frac         : fraction of the training pool held for validation
-    leak_mode        : 'sequential' | 'random_pool'
-    seed             : random seed for reproducibility
+    window_size      : samples per window (e.g. 1024 for 4 s at 256 Hz)
+    train_frac       : fraction of each clip's windows → training pool
+    val_frac         : fraction of each clip's windows → validation pool
+    seed             : random seed
 
     Returns
     -------
     (tr_wins, tr_lbls, tr_bvps, tr_cids,
      va_wins, va_lbls, va_bvps, va_cids,
      te_wins, te_lbls, te_bvps, te_cids)
-    Each element is a plain Python list.
     """
     rng = np.random.RandomState(seed)
 
-    # Accumulators
-    pool_wins, pool_lbls, pool_bvps, pool_cids = [], [], [], []
-    te_wins,   te_lbls,   te_bvps,   te_cids   = [], [], [], []
+    tr_wins, tr_lbls, tr_bvps, tr_cids = [], [], [], []
+    va_wins, va_lbls, va_bvps, va_cids = [], [], [], []
+    te_wins, te_lbls, te_bvps, te_cids = [], [], [], []
 
     for cid, (trial, label, bvp) in enumerate(
             zip(processed_trials, labels, bvp_feats)):
         C, T = trial.shape
 
-        if leak_mode == 'sequential':
-            # ── temporal boundary: first train_frac of recording → training ──
-            T_split = max(window_size, int(T * train_frac))
+        # Extract NON-overlapping windows (step = window_size)
+        # Non-overlapping ensures no sample-level leakage, only clip-level.
+        windows = []
+        for s in range(0, max(T - window_size + 1, 1), window_size):
+            w = trial[:, s:s + window_size]
+            if w.shape[1] < window_size:
+                w = np.pad(w, ((0, 0), (0, window_size - w.shape[1])))
+            windows.append(w.astype(np.float32))
 
-            # Training windows (with overlap)
-            for s in range(0, max(T_split - window_size + 1, 1), step_train):
-                w = trial[:, s:s + window_size]
-                if w.shape[1] < window_size:
-                    w = np.pad(w, ((0, 0), (0, window_size - w.shape[1])))
-                pool_wins.append(w.astype(np.float32))
-                pool_lbls.append(label)
-                pool_bvps.append(bvp)
-                pool_cids.append(cid)
+        n = len(windows)
+        if n == 0:
+            continue
 
-            # Test windows (non-overlapping, from the tail of the clip)
-            for s in range(T_split,
-                           max(T - window_size + 1, T_split + 1),
-                           step_test):
-                w = trial[:, s:s + window_size]
-                if w.shape[1] < window_size:
-                    w = np.pad(w, ((0, 0), (0, window_size - w.shape[1])))
-                te_wins.append(w.astype(np.float32))
-                te_lbls.append(label)
-                te_bvps.append(bvp)
-                te_cids.append(cid)
+        perm = rng.permutation(n)
+        n_tr = max(1, int(n * train_frac))
+        n_va = max(0, int(n * val_frac))
+        # Guarantee at least 1 window in test when n > 1
+        if n_tr + n_va >= n and n > 1:
+            n_tr = max(1, n - 2)
+            n_va = 1
 
-        else:  # 'random_pool'
-            # ── generate all windows from this clip, then split randomly ──
-            clip_wins = []
-            for s in range(0, max(T - window_size + 1, 1), step_train):
-                w = trial[:, s:s + window_size]
-                if w.shape[1] < window_size:
-                    w = np.pad(w, ((0, 0), (0, window_size - w.shape[1])))
-                clip_wins.append(w.astype(np.float32))
+        tr_idx = perm[:n_tr].tolist()
+        va_idx = perm[n_tr:n_tr + n_va].tolist()
+        te_idx = perm[n_tr + n_va:].tolist()
 
-            n_clip  = len(clip_wins)
-            perm_c  = rng.permutation(n_clip)
-            n_tr_c  = max(1, int(n_clip * train_frac))
-            tr_idx_c = perm_c[:n_tr_c].tolist()
-            te_idx_c = perm_c[n_tr_c:].tolist()
+        for i in tr_idx:
+            tr_wins.append(windows[i]); tr_lbls.append(label)
+            tr_bvps.append(bvp);        tr_cids.append(cid)
+        for i in va_idx:
+            va_wins.append(windows[i]); va_lbls.append(label)
+            va_bvps.append(bvp);        va_cids.append(cid)
+        for i in te_idx:
+            te_wins.append(windows[i]); te_lbls.append(label)
+            te_bvps.append(bvp);        te_cids.append(cid)
 
-            for i in tr_idx_c:
-                pool_wins.append(clip_wins[i])
-                pool_lbls.append(label)
-                pool_bvps.append(bvp)
-                pool_cids.append(cid)
-            for i in te_idx_c:
-                te_wins.append(clip_wins[i])
-                te_lbls.append(label)
-                te_bvps.append(bvp)
-                te_cids.append(cid)
-
-    # ── split training pool into train + val ──────────────────────────────────
-    n_pool = len(pool_wins)
-    perm   = rng.permutation(n_pool)
-    n_val  = max(1, int(n_pool * val_frac))
-    va_idx = perm[:n_val].tolist()
-    tr_idx = perm[n_val:].tolist()
-
-    def sel(lst, idx):
-        return [lst[i] for i in idx]
-
-    return (
-        sel(pool_wins, tr_idx), sel(pool_lbls, tr_idx),
-        sel(pool_bvps, tr_idx), sel(pool_cids, tr_idx),
-        sel(pool_wins, va_idx), sel(pool_lbls, va_idx),
-        sel(pool_bvps, va_idx), sel(pool_cids, va_idx),
-        te_wins, te_lbls, te_bvps, te_cids,
-    )
+    return (tr_wins, tr_lbls, tr_bvps, tr_cids,
+            va_wins, va_lbls, va_bvps, va_cids,
+            te_wins, te_lbls, te_bvps, te_cids)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -222,7 +167,7 @@ def make_leakage_split(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='MB-InvBase-BiMamba — Window-Leakage Experiment'
+        description='MB-InvBase-BiMamba — Clip-Leakage Experiment'
     )
 
     # ── data ──────────────────────────────────────────────────────────────────
@@ -235,30 +180,17 @@ def main():
     parser.add_argument('--emotions',      nargs='+',
                         default=['ENTHUSIASM', 'FEAR', 'NEUTRAL', 'SADNESS'])
     parser.add_argument('--min_trial_sec', type=float, default=5.0)
-    parser.add_argument('--norm_mode',     default='invbase',
-                        choices=['invbase', 'zscore'],
-                        help='Normalisation: invbase (default) or zscore')
+    parser.add_argument('--norm_mode',     default='zscore',
+                        choices=['invbase', 'zscore'])
 
-    # ── leakage split ──────────────────────────────────────────────────────────
-    parser.add_argument('--train_frac', type=float, default=0.80,
-        help='Fraction of each clip assigned to training.  '
-             'For sequential: fraction of TIME per clip (e.g. 0.80 → first 80%% → train).  '
-             'For random_pool: fraction of WINDOWS per clip.  '
-             'Range: 0.0–1.0.  Default: 0.80')
+    # ── clip leakage split ────────────────────────────────────────────────────
+    parser.add_argument('--train_frac', type=float, default=0.70,
+        help='Fraction of each clip\'s windows assigned to training. '
+             'Default: 0.70 (70 %% train / 15 %% val / 15 %% test per clip).')
     parser.add_argument('--val_frac',   type=float, default=0.15,
-        help='Fraction of training-pool windows held for validation.  Default: 0.15')
-    parser.add_argument('--leak_mode',  default='sequential',
-        choices=['sequential', 'random_pool'],
-        help='sequential   : first train_frac of each clip\'s TIME → train  '
-             '(RECOMMENDED — easier to interpret).  '
-             'random_pool  : all windows pooled and randomly split  '
-             '(maximum leakage — classic paper mistake).')
-    parser.add_argument('--overlap_frac',  type=float, default=0.70,
-        help='Overlap fraction for training windows (default: 0.70 → 70 %% overlap). '
-             'With 70 %% overlap the step is 307 samples, so consecutive windows '
-             'share 717 of 1024 raw samples.  In random_pool mode these near-duplicate '
-             'windows can end up in different splits, producing the strongest leakage. '
-             '0.50 reproduces the old behaviour (50 %% overlap = step 512).')
+        help='Fraction of each clip\'s windows assigned to validation. '
+             'Default: 0.15')
+
     # ── windowing ─────────────────────────────────────────────────────────────
     parser.add_argument('--window_sec', type=float, default=4.0,
         help='Window length in seconds.  Default: 4.0 (1024 samples at 256 Hz)')
@@ -268,37 +200,23 @@ def main():
     parser.add_argument('--n_layers',       type=int,   default=2)
     parser.add_argument('--d_state',        type=int,   default=16)
     parser.add_argument('--dropout',        type=float, default=0.10,
-        help='Dropout. LOW default (0.10) is intentional for the leakage demo: '
-             'allows the model to overfit training clips so leakage inflation is '
-             'visible. Use 0.60 only if you want to replicate the clean baseline.')
+        help='Dropout. LOW default (0.10) is intentional for the leakage demo.')
     parser.add_argument('--attn_reduction', type=int,   default=4)
 
     # ── training ──────────────────────────────────────────────────────────────
-    parser.add_argument('--epochs',        type=int,   default=150,
-        help='Training epochs. More epochs let the model overfit. Default: 150.')
+    parser.add_argument('--epochs',        type=int,   default=150)
     parser.add_argument('--batch_size',    type=int,   default=32)
-    parser.add_argument('--lr',            type=float, default=3e-4,
-        help='Learning rate. Higher than clean baseline (3e-4 vs 8e-5) to '
-             'accelerate overfitting to training clips.')
-    parser.add_argument('--weight_decay',  type=float, default=1e-3,
-        help='Weight decay. LOW default (0.001) is intentional for leakage demo.')
+    parser.add_argument('--lr',            type=float, default=3e-4)
+    parser.add_argument('--weight_decay',  type=float, default=1e-3)
     parser.add_argument('--warmup_epochs', type=int,   default=5)
-    parser.add_argument('--label_smooth',  type=float, default=0.05,
-        help='Label smoothing. LOW default (0.05) is intentional: model needs '
-             'confident predictions to demonstrate leakage inflation.')
-    parser.add_argument('--patience',      type=int,   default=50,
-        help='Early stopping patience. Larger than clean baseline to allow more '
-             'overfitting time.')
+    parser.add_argument('--label_smooth',  type=float, default=0.05)
+    parser.add_argument('--patience',      type=int,   default=50)
     parser.add_argument('--augment',       action='store_true', default=False,
-        help='Enable data augmentation on training windows (default: OFF). '
-             'Augmentation (Gaussian noise, band-dropout, time-masking) fights '
-             'memorisation and SUPPRESSES leakage inflation — keep it OFF for the '
-             'leakage demo. Pass --augment only for a regularised-leakage ablation.')
+        help='Enable augmentation (default: OFF — keeps leakage inflation visible).')
 
     # ── misc ──────────────────────────────────────────────────────────────────
     parser.add_argument('--seed',     type=int, default=42)
-    parser.add_argument('--save_dir', default=None,
-                        help='Directory to save the trained checkpoint.  Optional.')
+    parser.add_argument('--save_dir', default=None)
     parser.add_argument('--device',
                         default='cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -306,42 +224,27 @@ def main():
     setup_seed(args.seed)
 
     device       = torch.device(args.device)
-    window_size  = int(args.window_sec * FS)   # e.g. 4.0 * 256 = 1024
-    step_train   = max(1, int(window_size * (1.0 - args.overlap_frac)))
-    step_test    = window_size                 # non-overlapping for test
-    overlap_pct  = int(args.overlap_frac * 100)
+    window_size  = int(args.window_sec * FS)   # 4.0 * 256 = 1024
     samsung_root = args.samsung_root or args.data_root
     use_bvp      = not args.no_bvp
 
     # ── banner ────────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print(f"  MB-InvBase-BiMamba  —  Window-Leakage Experiment")
+    print(f"  MB-InvBase-BiMamba  —  Clip-Leakage Experiment")
     print(f"{'='*70}")
     print(f"  data_root  : {args.data_root}")
     print(f"  BVP fusion : {'ON' if use_bvp else 'OFF'}")
-    print(f"  window     : {args.window_sec}s → {window_size} samples  "
-          f"(step={step_train} → {overlap_pct}%% overlap)")
-    print(f"  leak_mode  : {args.leak_mode}")
-    if args.leak_mode == 'sequential':
-        print(f"  train_frac : {args.train_frac:.0%}  "
-              f"(first {args.train_frac:.0%} of each clip's TIME → train, "
-              f"last {(1 - args.train_frac)*100:.0f}% → test)")
-    else:
-        print(f"  train_frac : {args.train_frac:.0%}  "
-              f"({args.train_frac:.0%} of each clip's windows randomly → train)")
-    print(f"  val_frac   : {args.val_frac:.0%} of training pool → validation")
+    print(f"  window     : {args.window_sec}s = {window_size} samples (non-overlapping)")
+    print(f"  split      : {args.train_frac:.0%} train / {args.val_frac:.0%} val /"
+          f" {1-args.train_frac-args.val_frac:.0%} test  per clip")
+    print(f"  leakage    : clip-level (same clip windows in all splits; "
+          f"no sample duplication)")
     print(f"  model      : d_model={args.d_model}, n_layers={args.n_layers}, "
           f"dropout={args.dropout}")
     print(f"  training   : lr={args.lr}, wd={args.weight_decay}, "
           f"epochs={args.epochs}, patience={args.patience}")
-    print(f"  augment    : {'ON' if args.augment else 'OFF (allows memorisation)'}")
     print(f"  device     : {device}")
     print(f"{'='*70}\n")
-    if args.dropout > 0.30 or args.label_smooth > 0.10 or args.weight_decay > 0.01:
-        print("  WARNING: High regularisation detected — leakage inflation will be "
-              "suppressed.")
-        print("  For the leakage demo use defaults: "
-              "dropout=0.10, label_smooth=0.05, weight_decay=0.001\n")
 
     # ── 1. Load trials ─────────────────────────────────────────────────────────
     print("Step 1 — Loading trials...")
@@ -358,7 +261,6 @@ def main():
     # ── 2. Load baselines ──────────────────────────────────────────────────────
     print("Step 2 — Loading baselines...")
     if args.norm_mode == 'zscore':
-        from train_mb_invbase_bimamba import load_baselines_raw
         baseline_info = load_baselines_raw(args.data_root)
         print(f"  {len(baseline_info)} z-score baselines loaded\n")
     else:
@@ -374,8 +276,7 @@ def main():
         processed.append(proc)
         if (i + 1) % 20 == 0 or (i + 1) == len(trials):
             print(f"  {i+1}/{len(trials)} processed...", end="\r")
-    print(f"  {len(processed)} trials pre-processed  "
-          f"[shape per trial: (20, T_i)]\n")
+    print(f"  {len(processed)} trials pre-processed  [shape: (20, T_i)]\n")
 
     # ── 4. BVP features ────────────────────────────────────────────────────────
     emot_strs = [id2lab[l] for l in labels]
@@ -402,31 +303,29 @@ def main():
             bvp_list.append(vec)
         print(f"  BVP features: {n_found}/{len(trials)} trials\n")
 
-    # ── 5. Window-leakage split ────────────────────────────────────────────────
-    print(f"Step 5 — Window-leakage split "
-          f"(mode={args.leak_mode}, train_frac={args.train_frac:.0%})...")
+    # ── 5. Clip-leakage split ──────────────────────────────────────────────────
+    print(f"Step 5 — Clip-leakage split "
+          f"(train_frac={args.train_frac:.0%}, val_frac={args.val_frac:.0%})...")
     (tr_wins, tr_lbls, tr_bvps, tr_cids,
      va_wins, va_lbls, va_bvps, va_cids,
-     te_wins, te_lbls, te_bvps, te_cids) = make_leakage_split(
+     te_wins, te_lbls, te_bvps, te_cids) = make_clip_leakage_split(
         processed, labels, bvp_list,
-        window_size, step_train, step_test,
+        window_size,
         train_frac=args.train_frac,
         val_frac=args.val_frac,
-        leak_mode=args.leak_mode,
         seed=args.seed,
     )
     print(f"  Train : {len(tr_wins):5d} windows  from {len(set(tr_cids)):3d} clips")
     print(f"  Val   : {len(va_wins):5d} windows  from {len(set(va_cids)):3d} clips")
-    print(f"  Test  : {len(te_wins):5d} windows  from {len(set(te_cids)):3d} clips\n")
+    print(f"  Test  : {len(te_wins):5d} windows  from {len(set(te_cids)):3d} clips")
+    n_shared = len(set(tr_cids) & set(te_cids))
+    print(f"  Clips shared between train and test : {n_shared} "
+          f"(leakage = {n_shared}/{len(set(te_cids))} test clips)\n")
     if not te_wins:
-        print("ERROR: No test windows.  Reduce --train_frac or increase clip length.")
+        print("ERROR: No test windows.  Reduce --train_frac or increase trial length.")
         return
 
     # ── 6. Build datasets & loaders ────────────────────────────────────────────
-    # NOTE: augment=False by default — augmentation (noise, band-dropout,
-    # time-masking) fights memorisation of clip patterns and suppresses the
-    # leakage effect we want to demonstrate. Enable with --augment only for
-    # a regularised-leakage ablation comparison.
     tr_ds = EmognitionMBDataset(
         tr_wins, tr_lbls, tr_bvps if use_bvp else None, tr_cids,
         augment=args.augment)
@@ -474,7 +373,7 @@ def main():
     for ep in range(1, args.epochs + 1):
         model.train()
         tr_loss_sum, tr_n = 0.0, 0
-        tr_ok, tr_tot = 0, 0      # track training accuracy to monitor overfitting
+        tr_ok, tr_tot = 0, 0
         for batch in tr_dl:
             if use_bvp and len(batch) == 4:
                 bx, bb, by, _ = batch
@@ -531,43 +430,36 @@ def main():
     clip_true  = ret[8]
 
     print(f"\n{'='*70}")
-    print(f"  RESULTS — leak_mode={args.leak_mode}  "
+    print(f"  RESULTS — Clip Leakage  "
           f"train_frac={args.train_frac:.0%}  seed={args.seed}")
     print(f"{'='*70}")
     print(f"  Window Acc : {win_acc*100:.1f}%")
-    print(f"  Clip   Acc : {clip_acc*100:.1f}%  ← KEY METRIC")
+    print(f"  Clip   Acc : {clip_acc*100:.1f}%  <- KEY METRIC")
     print(f"  Clip   F1  : {clip_f1:.4f}")
     print(f"  Chance     : {100/NUM_CLASSES:.1f}%")
-    if args.leak_mode == 'sequential':
-        print(f"\n  Leakage note: model trained on first {args.train_frac:.0%} of "
-              f"EACH clip's recording time.")
-        print(f"  Test is the last {(1-args.train_frac)*100:.0f}% of each clip.")
-        print(f"  Compare with sub_indep baseline to see leakage inflation.")
-    else:
-        print(f"\n  ⚠  Maximum leakage: test windows randomly sampled from all clips.")
-        print(f"  Adjacent overlapping windows may be in both train and test.")
+    print(f"\n  Leakage note: same clip's windows appear in BOTH train and test.")
+    print(f"  Each window appears in exactly ONE split (no sample duplication).")
+    print(f"  Compare with sub_indep baseline to quantify clip-level leakage.")
     print(f"{'='*70}\n")
 
     if clip_preds and clip_true:
         print_report(clip_true, clip_preds,
-                     title=f'{args.leak_mode} train_frac={args.train_frac:.0%}')
+                     title=f'clip_leakage train_frac={args.train_frac:.0%}')
 
     # ── 10. Save checkpoint ────────────────────────────────────────────────────
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
-        name = (f'model_leak_{args.leak_mode}_'
-                f'frac{int(args.train_frac*100)}_seed{args.seed}.pt')
-        ckpt_path = os.path.join(args.save_dir, name)
+        ckpt_path = os.path.join(
+            args.save_dir,
+            f'clip_leakage_f{args.train_frac:.0f}_s{args.seed}.pt')
         torch.save({
-            'model_state': {k: v.cpu() for k, v in model.state_dict().items()},
+            'model_state': model.state_dict(),
             'args':        vars(args),
-            'class_names': CLASS_NAMES,
-            'bvp_dim':     BVP_DIM if use_bvp else 0,
             'win_acc':     win_acc,
             'clip_acc':    clip_acc,
             'clip_f1':     clip_f1,
         }, ckpt_path)
-        print(f"  [checkpoint] saved → {ckpt_path}")
+        print(f"  Checkpoint saved: {ckpt_path}")
 
 
 if __name__ == '__main__':
